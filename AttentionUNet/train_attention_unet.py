@@ -33,7 +33,7 @@ LABELS_TR_DIR = os.path.join(DATA_ROOT, "labelsTr")
 IMAGES_TS_DIR = os.path.join(DATA_ROOT, "imagesTs")
 LABELS_TS_DIR = os.path.join(DATA_ROOT, "labelsTs")
 
-RUNS_ROOT = os.path.join(".", "runs", "AttentionUnet")
+RUNS_ROOT = os.path.join("..", "runs", "AttentionUnet")
 
 SEED = 42
 NUM_FOLDS = 5
