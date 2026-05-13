@@ -12,7 +12,6 @@ from sklearn.model_selection import KFold
 from monai.data import DataLoader, Dataset, pad_list_data_collate
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
-from monai.metrics import DiceMetric
 from monai.networks.nets import AttentionUnet
 from monai.transforms import (
     Compose,
@@ -144,6 +143,14 @@ def _binarize_label(x):
     return (x > 0).astype(x.dtype)
 
 
+def compute_binary_dice(y_pred: torch.Tensor, y_true: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    reduce_dims = tuple(range(2, y_pred.ndim))
+    intersection = torch.sum(y_pred * y_true, dim=reduce_dims)
+    denominator = torch.sum(y_pred, dim=reduce_dims) + torch.sum(y_true, dim=reduce_dims)
+    dice = (2.0 * intersection + eps) / (denominator + eps)
+    return dice.mean()
+
+
 def build_transforms(args):
     # HU window: width=400, level=40 -> [-160, 240]
     hu_min, hu_max = -160.0, 240.0
@@ -231,8 +238,6 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
         min_lr=1e-6,
     )
 
-    # For single-channel sigmoid binary segmentation, keep channel 0 for dice computation.
-    dice_metric = DiceMetric(include_background=True, reduction="mean")
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -289,7 +294,8 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
             train_loss = train_loss / max(len(train_loader), 1)
 
             model.eval()
-            dice_metric.reset()
+            val_dice_sum = 0.0
+            val_dice_count = 0
             with torch.no_grad():
                 for val_batch in val_loader:
                     val_inputs = val_batch["image"].to(device)
@@ -300,12 +306,13 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
                     )
                     val_outputs = torch.sigmoid(val_outputs)
                     val_outputs = (val_outputs > 0.5).float()
-                    dice_metric(y_pred=val_outputs, y=val_labels)
+                    batch_dice = compute_binary_dice(val_outputs, val_labels)
+                    val_dice_sum += float(batch_dice.item())
+                    val_dice_count += 1
 
-            metric = float(dice_metric.aggregate().item())
+            metric = val_dice_sum / max(val_dice_count, 1)
             if math.isnan(metric):
                 metric = 0.0
-            dice_metric.reset()
             scheduler.step(metric)
 
             lr_now = optimizer.param_groups[0]["lr"]
