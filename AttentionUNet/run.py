@@ -11,8 +11,8 @@ from sklearn.model_selection import KFold
 # =========================
 # Run Config (edit here)
 # =========================
-DATA_ROOT = r"D:\data\your_dataset_root"
-SAVE_ROOT = r"D:\project\Monai_model\AttentionUNet\output"
+DATA_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/EsoCTV_All"
+SAVE_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/Networks/AttentionUNet/EsoCTV_All"
 RUNS_ROOT = os.path.join(SAVE_ROOT, "TrainResults")
 PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 
@@ -21,7 +21,7 @@ CUDA_VISIBLE_DEVICES = "0"   # e.g. "0" / "1" / "0,1"
 NUM_FOLDS = 5
 MAX_EPOCHS = 200
 EARLY_STOP_PATIENCE = 30
-TRAIN_BATCH_SIZE = 1
+TRAIN_BATCH_SIZE = 4
 TEST_BATCH_SIZE = 1
 LR = 1e-4
 SEED = 42
@@ -30,6 +30,8 @@ VAL_WORKERS = 2
 TEST_WORKERS = 2
 ROI_X, ROI_Y, ROI_Z = 96, 96, 96
 THRESHOLD = 0.5
+ACCUMULATE_STEPS = 4
+USE_AMP = True
 
 AUTO_RESUME = True
 # =========================
@@ -197,9 +199,13 @@ def main():
             str(ROI_Y),
             "--roi_z",
             str(ROI_Z),
+            "--accumulate_steps",
+            str(ACCUMULATE_STEPS),
             "--only_fold",
             str(fold),
         ]
+        if USE_AMP:
+            cmd.append("--amp")
         if AUTO_RESUME:
             cmd.append("--resume")
         run_cmd(cmd, env)

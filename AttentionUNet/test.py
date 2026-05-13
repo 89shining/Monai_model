@@ -1,5 +1,4 @@
 ﻿import argparse
-import csv
 import glob
 import os
 
@@ -8,11 +7,11 @@ import torch
 from monai.data import DataLoader, Dataset
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import AttentionUnet
-from monai.transforms import Compose, EnsureChannelFirstd, EnsureTyped, LoadImaged, ScaleIntensityd
+from monai.transforms import Compose, EnsureChannelFirstd, EnsureTyped, Lambdad, LoadImaged, ScaleIntensityRanged
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AttentionUNet testing with best-fold auto selection.")
+    parser = argparse.ArgumentParser(description="AttentionUNet testing with 5-fold ensemble.")
     parser.add_argument("--data_root", type=str, required=True, help="Dataset root directory.")
     parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet", help="Training runs root.")
     parser.add_argument("--save_dir", type=str, default="./predictions", help="Prediction output directory.")
@@ -22,7 +21,8 @@ def parse_args():
     parser.add_argument("--roi_y", type=int, default=96, help="Sliding-window ROI y.")
     parser.add_argument("--roi_z", type=int, default=96, help="Sliding-window ROI z.")
     parser.add_argument("--threshold", type=float, default=0.5, help="Sigmoid threshold.")
-    parser.add_argument("--fold", type=int, default=None, help="Force a specific fold. If omitted, choose best fold from cv_results.csv.")
+    parser.add_argument("--num_folds", type=int, default=5, help="Number of folds for ensemble loading.")
+    parser.add_argument("--fold", type=int, default=None, help="Force single fold inference and disable ensemble.")
     return parser.parse_args()
 
 
@@ -43,6 +43,10 @@ def image_case_id(path: str) -> str:
 
 def label_case_id(path: str) -> str:
     return strip_nii_ext(os.path.basename(path))
+
+
+def _binarize_label(x):
+    return (x > 0).astype(x.dtype)
 
 
 def build_test_data(data_root: str):
@@ -71,25 +75,6 @@ def build_test_data(data_root: str):
     return [{"image": image_map[cid], "label": label_map[cid]} for cid in case_ids]
 
 
-def select_best_fold_from_cv(runs_root: str) -> int:
-    cv_path = os.path.join(runs_root, "cv_results.csv")
-    if not os.path.exists(cv_path):
-        raise FileNotFoundError(f"cv_results.csv not found: {cv_path}")
-
-    with open(cv_path, "r", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    if not rows:
-        raise ValueError(f"cv_results.csv is empty: {cv_path}")
-
-    required = {"fold", "best_dice_fg"}
-    if not required.issubset(set(rows[0].keys())):
-        raise ValueError("cv_results.csv must contain columns: fold,best_dice_fg")
-
-    best_row = max(rows, key=lambda r: float(r["best_dice_fg"]))
-    return int(best_row["fold"])
-
-
 def load_model(runs_root: str, fold: int, device: torch.device):
     model_path = os.path.join(runs_root, f"fold_{fold}", f"best_model_fold{fold}.pth")
     if not os.path.exists(model_path):
@@ -113,14 +98,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
 
-    fold = args.fold if args.fold is not None else select_best_fold_from_cv(args.runs_root)
-    model, model_path = load_model(args.runs_root, fold, device)
+    folds = [args.fold] if args.fold is not None else list(range(args.num_folds))
+    models = []
+    model_paths = []
+    for fold in folds:
+        model, model_path = load_model(args.runs_root, fold, device)
+        models.append(model)
+        model_paths.append(model_path)
 
     data_dicts = build_test_data(args.data_root)
     test_transforms = Compose([
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
-        ScaleIntensityd(keys="image"),
+        ScaleIntensityRanged(keys="image", a_min=-160.0, a_max=240.0, b_min=0.0, b_max=1.0, clip=True),
+        Lambdad(keys="label", func=_binarize_label),
         EnsureTyped(keys=["image", "label"]),
     ])
     test_ds = Dataset(data_dicts, test_transforms)
@@ -132,18 +123,25 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    print("\n===== AttentionUNet Test (best fold only) =====")
+    print("\n===== AttentionUNet Test (probability-map ensemble) =====")
     print(f"Device: {device}")
-    print(f"Selected fold: {fold}")
-    print(f"Model: {model_path}")
+    print(f"Folds: {folds}")
+    for p in model_paths:
+        print(f"Model: {p}")
     print(f"Save dir: {args.save_dir}")
 
     roi_size = (args.roi_x, args.roi_y, args.roi_z)
     with torch.no_grad():
         for batch in test_loader:
             image = batch["image"].to(device)
-            output = sliding_window_inference(image, roi_size=roi_size, sw_batch_size=1, predictor=model)
-            output = torch.sigmoid(output)
+
+            prob_sum = None
+            for model in models:
+                logits = sliding_window_inference(image, roi_size=roi_size, sw_batch_size=1, predictor=model)
+                probs = torch.sigmoid(logits)
+                prob_sum = probs if prob_sum is None else (prob_sum + probs)
+
+            output = prob_sum / float(len(models))
             output = (output > args.threshold).float()
 
             bs = output.shape[0]
@@ -156,6 +154,7 @@ def main():
 
                 itk_img = sitk.ReadImage(image_path)
                 pred_itk = sitk.GetImageFromArray(pred)
+                # Keep shape/spacing/origin/direction exactly aligned to original CT geometry.
                 pred_itk.CopyInformation(itk_img)
 
                 out_path = os.path.join(args.save_dir, save_name)

@@ -1,22 +1,18 @@
-﻿import csv
-import glob
-import os
+﻿import os
 import subprocess
 import sys
 import time
 from typing import Dict, List
 
-from sklearn.model_selection import KFold
-
 # =========================
 # Run Config (edit here)
 # =========================
-DATA_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/EsoCTV_All"
-SAVE_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/Networks/VNet"
+DATA_ROOT = r"D:\data\your_dataset_root"
+SAVE_ROOT = r"D:\project\Monai_model\VNet\output"
 RUNS_ROOT = os.path.join(SAVE_ROOT, "TrainResults")
 PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 
-CUDA_VISIBLE_DEVICES = "5"
+CUDA_VISIBLE_DEVICES = "0"
 
 NUM_FOLDS = 5
 MAX_EPOCHS = 200
@@ -77,8 +73,9 @@ def main():
             "--roi_z", str(ROI_Z),
             "--only_fold", str(fold),
         ]
+        if AUTO_RESUME:
+            cmd.append("--resume")
 
-        # ❌ 不再传 --resume
         run_cmd(cmd, env)
 
         os.makedirs(fold_dir, exist_ok=True)

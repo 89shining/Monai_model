@@ -16,13 +16,15 @@ from monai.metrics import DiceMetric
 from monai.networks.nets import AttentionUnet
 from monai.transforms import (
     Compose,
-    DivisiblePadd,
     EnsureChannelFirstd,
     EnsureTyped,
+    Lambdad,
     LoadImaged,
+    RandCropByPosNegLabeld,
     RandFlipd,
     RandRotate90d,
-    ScaleIntensityd,
+    ScaleIntensityRanged,
+    SpatialPadd,
 )
 from monai.utils import set_determinism
 
@@ -42,6 +44,9 @@ def parse_args():
     parser.add_argument("--roi_x", type=int, default=96, help="Sliding-window ROI x.")
     parser.add_argument("--roi_y", type=int, default=96, help="Sliding-window ROI y.")
     parser.add_argument("--roi_z", type=int, default=96, help="Sliding-window ROI z.")
+    parser.add_argument("--num_samples", type=int, default=4, help="Num patches sampled per image each iteration.")
+    parser.add_argument("--accumulate_steps", type=int, default=1, help="Gradient accumulation steps.")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision training.")
     parser.add_argument(
         "--only_fold",
         type=int,
@@ -135,27 +140,42 @@ def build_data_dicts(data_root: str):
     return [{"image": image_map[cid], "label": label_map[cid], "case_id": cid} for cid in case_ids]
 
 
-def build_transforms():
+def _binarize_label(x):
+    return (x > 0).astype(x.dtype)
+
+
+def build_transforms(args):
+    # HU window: width=400, level=40 -> [-160, 240]
+    hu_min, hu_max = -160.0, 240.0
+    roi_size = (args.roi_x, args.roi_y, args.roi_z)
     train_transforms = Compose(
         [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            ScaleIntensityd(keys="image"),
+            ScaleIntensityRanged(keys="image", a_min=hu_min, a_max=hu_max, b_min=0.0, b_max=1.0, clip=True),
+            Lambdad(keys="label", func=_binarize_label),
+            SpatialPadd(keys=["image", "label"], spatial_size=roi_size),
+            RandCropByPosNegLabeld(
+                keys=["image", "label"],
+                label_key="label",
+                spatial_size=roi_size,
+                pos=3,
+                neg=1,
+                num_samples=args.num_samples,
+            ),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
             RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
-            DivisiblePadd(keys=["image", "label"], k=16),
-            EnsureTyped(keys=["image", "label"]),
+            EnsureTyped(keys=["image", "label"], dtype=torch.float32),
         ]
     )
     val_transforms = Compose(
         [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            ScaleIntensityd(keys="image"),
-            DivisiblePadd(keys=["image", "label"], k=16),
-            EnsureTyped(keys=["image", "label"]),
+            ScaleIntensityRanged(keys="image", a_min=hu_min, a_max=hu_max, b_min=0.0, b_max=1.0, clip=True),
+            Lambdad(keys="label", func=_binarize_label),
+            EnsureTyped(keys=["image", "label"], dtype=torch.float32),
         ]
     )
     return train_transforms, val_transforms
@@ -179,7 +199,7 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
     epoch_log_path = os.path.join(fold_dir, "epoch_metrics.csv")
     last_state_path = os.path.join(fold_dir, f"last_state_fold{fold}.pt")
 
-    train_transforms, val_transforms = build_transforms()
+    train_transforms, val_transforms = build_transforms(args)
     train_ds = Dataset(train_files, train_transforms)
     val_ds = Dataset(val_files, val_transforms)
 
@@ -211,7 +231,10 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
         min_lr=1e-6,
     )
 
-    dice_metric = DiceMetric(include_background=False, reduction="mean")
+    # For single-channel sigmoid binary segmentation, keep channel 0 for dice computation.
+    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_metric = -1.0
     best_epoch = -1
@@ -224,6 +247,8 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
+        if "scaler" in state and state["scaler"] is not None:
+            scaler.load_state_dict(state["scaler"])
         start_epoch = int(state["epoch"]) + 1
         best_metric = float(state["best_metric"])
         best_epoch = int(state["best_epoch"])
@@ -242,16 +267,22 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
         for epoch in range(start_epoch, args.max_epochs):
             model.train()
             train_loss = 0.0
+            optimizer.zero_grad(set_to_none=True)
 
-            for batch in train_loader:
+            for step, batch in enumerate(train_loader, start=1):
                 inputs = batch["image"].to(device)
                 labels = batch["label"].to(device)
 
-                optimizer.zero_grad(set_to_none=True)
-                outputs = model(inputs)
-                loss = loss_function(outputs, labels)
-                loss.backward()
-                optimizer.step()
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    outputs = model(inputs)
+                    loss = loss_function(outputs, labels)
+                    loss_for_backward = loss / max(args.accumulate_steps, 1)
+                scaler.scale(loss_for_backward).backward()
+
+                if step % max(args.accumulate_steps, 1) == 0 or step == len(train_loader):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
                 train_loss += loss.item()
 
@@ -302,6 +333,7 @@ def train_one_fold(fold: int, train_files, val_files, args, device: torch.device
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict() if use_amp else None,
                     "best_metric": best_metric,
                     "best_epoch": best_epoch,
                     "epochs_no_improve": epochs_no_improve,
@@ -354,6 +386,14 @@ def main():
         print(f"\n===== Fold {fold} =====")
         train_files = [data_dicts[i] for i in train_idx]
         val_files = [data_dicts[i] for i in val_idx]
+        fold_dir = os.path.join(args.runs_root, f"fold_{fold}")
+        os.makedirs(fold_dir, exist_ok=True)
+        with open(os.path.join(fold_dir, "train_cases.txt"), "w", encoding="utf-8") as f:
+            for d in train_files:
+                f.write(f"{d['case_id']}\n")
+        with open(os.path.join(fold_dir, "val_cases.txt"), "w", encoding="utf-8") as f:
+            for d in val_files:
+                f.write(f"{d['case_id']}\n")
 
         result = train_one_fold(fold, train_files, val_files, args, device)
         fold_results.append(result)
@@ -366,22 +406,28 @@ def main():
         raise ValueError("No fold was trained. Check --only_fold setting.")
 
     summary_path = os.path.join(args.runs_root, "cv_results.csv")
+    merged = {}
+    if os.path.exists(summary_path):
+        with open(summary_path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                merged[int(row["fold"])] = row
+    for r in fold_results:
+        merged[int(r["fold"])] = {
+            "fold": str(r["fold"]),
+            "best_epoch": str(r["best_epoch"]),
+            "best_dice_fg": f"{r['best_dice_fg']:.6f}",
+            "num_train": str(r["num_train"]),
+            "num_val": str(r["num_val"]),
+            "checkpoint": r["checkpoint"],
+        }
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["fold", "best_epoch", "best_dice_fg", "num_train", "num_val", "checkpoint"])
-        for r in fold_results:
-            writer.writerow(
-                [
-                    r["fold"],
-                    r["best_epoch"],
-                    f"{r['best_dice_fg']:.6f}",
-                    r["num_train"],
-                    r["num_val"],
-                    r["checkpoint"],
-                ]
-            )
+        fieldnames = ["fold", "best_epoch", "best_dice_fg", "num_train", "num_val", "checkpoint"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for fold in sorted(merged.keys()):
+            writer.writerow(merged[fold])
 
-    best_scores = np.array([r["best_dice_fg"] for r in fold_results], dtype=np.float32)
+    best_scores = np.array([float(merged[k]["best_dice_fg"]) for k in sorted(merged.keys())], dtype=np.float32)
     print("\n===== Cross-Validation Summary =====")
     print(f"Saved summary: {summary_path}")
     print(f"Dice(FG) mean={best_scores.mean():.4f}, std={best_scores.std(ddof=0):.4f}")
