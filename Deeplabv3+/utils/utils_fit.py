@@ -159,8 +159,11 @@ def fit_one_epoch(model_train, model, loss_history, eval_callback, optimizer, ep
         print('Finish Validation')
         loss_history.append_loss(epoch + 1, total_loss / epoch_step, val_loss / epoch_step_val)
         eval_callback.on_epoch_end(epoch + 1, model_train)
+        cur_train_loss = total_loss / epoch_step
+        cur_val_loss = val_loss / epoch_step_val
+        cur_val_f = val_f_score / epoch_step_val
         print('Epoch:'+ str(epoch + 1) + '/' + str(Epoch))
-        print('Total Loss: %.3f || Val Loss: %.3f ' % (total_loss / epoch_step, val_loss / epoch_step_val))
+        print('Total Loss: %.3f || Val Loss: %.3f || Val Dice: %.3f ' % (cur_train_loss, cur_val_loss, cur_val_f))
         
         #-----------------------------------------------#
         #   保存权值

@@ -1,74 +1,182 @@
 ﻿import argparse
 import csv
 import glob
-import math
 import os
 import random
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from sklearn.model_selection import KFold
+import torch.nn as nn
 
-from monai.data import DataLoader, Dataset, pad_list_data_collate
+from monai.data import DataLoader, Dataset, decollate_batch, list_data_collate
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
-from monai.networks.nets import AttentionUnet
+from monai.metrics import DiceMetric
 from monai.transforms import (
+    Activations,
+    AsDiscrete,
     Compose,
     EnsureChannelFirstd,
     EnsureTyped,
     Lambdad,
     LoadImaged,
+    Orientationd,
+    RandAffined,
     RandCropByPosNegLabeld,
     RandFlipd,
-    RandRotate90d,
+    RandGaussianNoised,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
     ScaleIntensityRanged,
+    Spacingd,
     SpatialPadd,
 )
-from monai.utils import set_determinism
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AttentionUNet 3D segmentation training (KFold).")
-    parser.add_argument("--data_root", type=str, required=True, help="Dataset root directory.")
-    parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet", help="Output root.")
-    parser.add_argument("--num_folds", type=int, default=5, help="Number of KFold splits.")
-    parser.add_argument("--max_epochs", type=int, default=200, help="Maximum epochs.")
-    parser.add_argument("--early_stop_patience", type=int, default=30, help="Early-stop patience.")
-    parser.add_argument("--batch_size", type=int, default=1, help="Training batch size.")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
-    parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
-    parser.add_argument("--train_workers", type=int, default=4, help="Num workers for training loader.")
-    parser.add_argument("--val_workers", type=int, default=2, help="Num workers for validation loader.")
-    parser.add_argument("--roi_x", type=int, default=96, help="Sliding-window ROI x.")
-    parser.add_argument("--roi_y", type=int, default=96, help="Sliding-window ROI y.")
-    parser.add_argument("--roi_z", type=int, default=96, help="Sliding-window ROI z.")
-    parser.add_argument("--num_samples", type=int, default=4, help="Num patches sampled per image each iteration.")
-    parser.add_argument("--accumulate_steps", type=int, default=1, help="Gradient accumulation steps.")
-    parser.add_argument("--amp", action="store_true", help="Enable mixed precision training.")
-    parser.add_argument(
-        "--only_fold",
-        type=int,
-        default=None,
-        help="Train only one fold index (e.g. 0~4).",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from last_state checkpoint of a fold if available.",
-    )
+    parser = argparse.ArgumentParser(description="3D AttentionUNet training with K-fold CV.")
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet")
+    parser.add_argument("--num_folds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=2026)
+
+    parser.add_argument("--max_epochs", type=int, default=200)
+    parser.add_argument("--early_stop_patience", type=int, default=40)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--eta_min", type=float, default=1e-6)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--grad_clip", type=float, default=12.0)
+
+    parser.add_argument("--roi_x", type=int, default=96)
+    parser.add_argument("--roi_y", type=int, default=96)
+    parser.add_argument("--roi_z", type=int, default=64)
+    parser.add_argument("--num_samples", type=int, default=4)
+    parser.add_argument("--sw_batch_size", type=int, default=2)
+    parser.add_argument("--infer_overlap", type=float, default=0.5)
+
+    parser.add_argument("--a_min", type=float, default=-160.0)
+    parser.add_argument("--a_max", type=float, default=240.0)
+
+    parser.add_argument("--pixdim_x", type=float, default=1.0)
+    parser.add_argument("--pixdim_y", type=float, default=1.0)
+    parser.add_argument("--pixdim_z", type=float, default=1.0)
+    parser.add_argument("--axcodes", type=str, default="RAS")
+
+    parser.add_argument("--f1", type=int, default=32)
+    parser.add_argument("--f2", type=int, default=64)
+    parser.add_argument("--f3", type=int, default=128)
+    parser.add_argument("--f4", type=int, default=256)
+    parser.add_argument("--f5", type=int, default=512)
+
+    parser.add_argument("--only_fold", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
 
-def set_all_seeds(seed: int):
-    set_determinism(seed)
+def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def binarize_label(x):
+    if isinstance(x, torch.Tensor):
+        return (x > 0).float()
+    return (x > 0).astype(np.float32)
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_channels),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(out_channels),
+            nn.LeakyReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class AttentionGate(nn.Module):
+    def __init__(self, g_channels: int, x_channels: int, inter_channels: int):
+        super().__init__()
+        self.wg = nn.Sequential(
+            nn.Conv3d(g_channels, inter_channels, kernel_size=1, bias=True),
+            nn.InstanceNorm3d(inter_channels),
+        )
+        self.wx = nn.Sequential(
+            nn.Conv3d(x_channels, inter_channels, kernel_size=1, bias=True),
+            nn.InstanceNorm3d(inter_channels),
+        )
+        self.psi = nn.Sequential(nn.Conv3d(inter_channels, 1, kernel_size=1, bias=True), nn.Sigmoid())
+        self.relu = nn.LeakyReLU(inplace=True)
+
+    def forward(self, g, x):
+        psi = self.relu(self.wg(g) + self.wx(x))
+        psi = self.psi(psi)
+        return x * psi
+
+
+class AttentionUNet3D(nn.Module):
+    def __init__(self, in_channels: int = 1, out_channels: int = 1, features: Tuple[int, int, int, int, int] = (32, 64, 128, 256, 512)):
+        super().__init__()
+        f1, f2, f3, f4, f5 = features
+        self.enc1 = ConvBlock(in_channels, f1)
+        self.pool1 = nn.MaxPool3d(2, 2)
+        self.enc2 = ConvBlock(f1, f2)
+        self.pool2 = nn.MaxPool3d(2, 2)
+        self.enc3 = ConvBlock(f2, f3)
+        self.pool3 = nn.MaxPool3d(2, 2)
+        self.enc4 = ConvBlock(f3, f4)
+        self.pool4 = nn.MaxPool3d(2, 2)
+        self.bottleneck = ConvBlock(f4, f5)
+
+        self.up4 = nn.ConvTranspose3d(f5, f4, kernel_size=2, stride=2)
+        self.att4 = AttentionGate(f4, f4, f4 // 2)
+        self.dec4 = ConvBlock(f4 + f4, f4)
+
+        self.up3 = nn.ConvTranspose3d(f4, f3, kernel_size=2, stride=2)
+        self.att3 = AttentionGate(f3, f3, f3 // 2)
+        self.dec3 = ConvBlock(f3 + f3, f3)
+
+        self.up2 = nn.ConvTranspose3d(f3, f2, kernel_size=2, stride=2)
+        self.att2 = AttentionGate(f2, f2, f2 // 2)
+        self.dec2 = ConvBlock(f2 + f2, f2)
+
+        self.up1 = nn.ConvTranspose3d(f2, f1, kernel_size=2, stride=2)
+        self.att1 = AttentionGate(f1, f1, f1 // 2)
+        self.dec1 = ConvBlock(f1 + f1, f1)
+
+        self.out_conv = nn.Conv3d(f1, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+        b = self.bottleneck(self.pool4(e4))
+
+        d4 = self.dec4(torch.cat([self.att4(self.up4(b), e4), self.up4(b)], dim=1))
+        d3 = self.dec3(torch.cat([self.att3(self.up3(d4), e3), self.up3(d4)], dim=1))
+        d2 = self.dec2(torch.cat([self.att2(self.up2(d3), e2), self.up2(d3)], dim=1))
+        d1 = self.dec1(torch.cat([self.att1(self.up1(d2), e1), self.up1(d2)], dim=1))
+        return self.out_conv(d1)
 
 
 def strip_nii_ext(filename: str) -> str:
@@ -86,358 +194,353 @@ def image_case_id(path: str) -> str:
     return name
 
 
-def label_case_id(path: str) -> str:
-    return strip_nii_ext(os.path.basename(path))
+def collect_data_list(data_root: str) -> List[Dict[str, str]]:
+    image_dir = os.path.join(data_root, "imagesTr")
+    label_dir = os.path.join(data_root, "labelsTr")
+    image_paths = sorted(glob.glob(os.path.join(image_dir, "*.nii.gz")) + glob.glob(os.path.join(image_dir, "*.nii")))
+    if len(image_paths) == 0:
+        raise RuntimeError(f"No NIfTI files found in: {image_dir}")
+
+    data_list = []
+    for image_path in image_paths:
+        case_id = image_case_id(image_path)
+        p1 = os.path.join(label_dir, f"{case_id}.nii.gz")
+        p2 = os.path.join(label_dir, f"{case_id}.nii")
+        if os.path.exists(p1):
+            label_path = p1
+        elif os.path.exists(p2):
+            label_path = p2
+        else:
+            raise FileNotFoundError(f"Label not found for case: {case_id}")
+        data_list.append({"case_id": case_id, "image": image_path, "label": label_path})
+    return data_list
 
 
-def build_data_dicts(data_root: str):
-    image_patterns = [
-        os.path.join(data_root, "imagesTr", "*_0000.nii.gz"),
-        os.path.join(data_root, "imagesTr", "*_0000.nii"),
-    ]
-    label_patterns = [
-        os.path.join(data_root, "labelsTr", "*.nii.gz"),
-        os.path.join(data_root, "labelsTr", "*.nii"),
-    ]
+def make_kfold_splits(data_list: List[Dict[str, str]], num_folds: int, seed: int):
+    indices = list(range(len(data_list)))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
 
-    images = []
-    labels = []
-    for p in image_patterns:
-        images.extend(glob.glob(p))
-    for p in label_patterns:
-        labels.extend(glob.glob(p))
+    fold_sizes = [len(indices) // num_folds] * num_folds
+    for i in range(len(indices) % num_folds):
+        fold_sizes[i] += 1
 
-    images = sorted(set(images))
-    labels = sorted(set(labels))
+    folds = []
+    start = 0
+    for fs in fold_sizes:
+        end = start + fs
+        folds.append(indices[start:end])
+        start = end
 
-    if not images:
-        raise FileNotFoundError(f"No training images found under: {os.path.join(data_root, 'imagesTr')}")
-    if not labels:
-        raise FileNotFoundError(f"No training labels found under: {os.path.join(data_root, 'labelsTr')}")
-
-    image_map = {image_case_id(p): p for p in images}
-    label_map = {label_case_id(p): p for p in labels}
-
-    image_ids = set(image_map.keys())
-    label_ids = set(label_map.keys())
-
-    missing_labels = sorted(image_ids - label_ids)
-    missing_images = sorted(label_ids - image_ids)
-    if missing_labels or missing_images:
-        msg = [
-            "Image/label case IDs are inconsistent.",
-            f"Missing labels for {len(missing_labels)} image IDs.",
-            f"Missing images for {len(missing_images)} label IDs.",
-        ]
-        if missing_labels:
-            msg.append(f"Example missing labels: {missing_labels[:5]}")
-        if missing_images:
-            msg.append(f"Example missing images: {missing_images[:5]}")
-        raise ValueError(" ".join(msg))
-
-    case_ids = sorted(image_ids)
-    return [{"image": image_map[cid], "label": label_map[cid], "case_id": cid} for cid in case_ids]
+    splits = []
+    for fold_idx in range(num_folds):
+        val_indices = folds[fold_idx]
+        train_indices = []
+        for i in range(num_folds):
+            if i != fold_idx:
+                train_indices.extend(folds[i])
+        splits.append(([data_list[i] for i in train_indices], [data_list[i] for i in val_indices]))
+    return splits
 
 
-def _binarize_label(x):
-    return (x > 0).astype(x.dtype)
-
-
-def compute_binary_dice(y_pred: torch.Tensor, y_true: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    reduce_dims = tuple(range(2, y_pred.ndim))
-    intersection = torch.sum(y_pred * y_true, dim=reduce_dims)
-    denominator = torch.sum(y_pred, dim=reduce_dims) + torch.sum(y_true, dim=reduce_dims)
-    dice = (2.0 * intersection + eps) / (denominator + eps)
-    return dice.mean()
-
-
-def build_transforms(args):
-    # HU window: width=400, level=40 -> [-160, 240]
-    hu_min, hu_max = -160.0, 240.0
+def get_transforms(args):
     roi_size = (args.roi_x, args.roi_y, args.roi_z)
-    train_transforms = Compose(
-        [
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"]),
-            ScaleIntensityRanged(keys="image", a_min=hu_min, a_max=hu_max, b_min=0.0, b_max=1.0, clip=True),
-            Lambdad(keys="label", func=_binarize_label),
-            SpatialPadd(keys=["image", "label"], spatial_size=roi_size),
-            RandCropByPosNegLabeld(
-                keys=["image", "label"],
-                label_key="label",
-                spatial_size=roi_size,
-                pos=3,
-                neg=1,
-                num_samples=args.num_samples,
-            ),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-            RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
-            EnsureTyped(keys=["image", "label"], dtype=torch.float32),
-        ]
-    )
-    val_transforms = Compose(
-        [
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"]),
-            ScaleIntensityRanged(keys="image", a_min=hu_min, a_max=hu_max, b_min=0.0, b_max=1.0, clip=True),
-            Lambdad(keys="label", func=_binarize_label),
-            EnsureTyped(keys=["image", "label"], dtype=torch.float32),
-        ]
-    )
+    pixdim = (args.pixdim_x, args.pixdim_y, args.pixdim_z)
+
+    train_transforms = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes=args.axcodes),
+        Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+        ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
+        Lambdad(keys=["label"], func=binarize_label),
+        SpatialPadd(keys=["image", "label"], spatial_size=roi_size),
+        RandCropByPosNegLabeld(
+            keys=["image", "label"],
+            label_key="label",
+            spatial_size=roi_size,
+            pos=1,
+            neg=1,
+            num_samples=args.num_samples,
+            image_key="image",
+            image_threshold=0,
+        ),
+        RandFlipd(keys=["image", "label"], spatial_axis=0, prob=0.5),
+        RandFlipd(keys=["image", "label"], spatial_axis=1, prob=0.5),
+        RandAffined(
+            keys=["image", "label"],
+            prob=0.2,
+            rotate_range=(0.1, 0.1, 0.05),
+            scale_range=(0.1, 0.1, 0.05),
+            mode=("bilinear", "nearest"),
+            padding_mode="border",
+        ),
+        RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
+        RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.3),
+        RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.01),
+        EnsureTyped(keys=["image", "label"], dtype=torch.float32),
+    ])
+
+    val_transforms = Compose([
+        LoadImaged(keys=["image", "label"]),
+        EnsureChannelFirstd(keys=["image", "label"]),
+        Orientationd(keys=["image", "label"], axcodes=args.axcodes),
+        Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+        ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
+        Lambdad(keys=["label"], func=binarize_label),
+        EnsureTyped(keys=["image", "label"], dtype=torch.float32),
+    ])
     return train_transforms, val_transforms
 
 
-def build_model(device: torch.device):
-    model = AttentionUnet(
-        spatial_dims=3,
-        in_channels=1,
-        out_channels=1,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
-    ).to(device)
-    return model
+def train_one_epoch(model, loader, optimizer, loss_func, device, args, fold_idx: int, epoch: int, max_epochs: int):
+    model.train()
+    epoch_loss = 0.0
+    steps = 0
+    total_steps = len(loader)
+    for batch_data in loader:
+        steps += 1
+        images = batch_data["image"].to(device)
+        labels = batch_data["label"].to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = loss_func(logits, labels)
+        loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+        epoch_loss += loss.item()
+        print(
+            f"Fold {fold_idx} | Epoch {epoch}/{max_epochs} | "
+            f"Step {steps}/{total_steps} | TrainLoss {loss.item():.4f}",
+            flush=True,
+        )
+    return epoch_loss / max(steps, 1)
 
 
-def train_one_fold(fold: int, train_files, val_files, args, device: torch.device):
-    fold_dir = os.path.join(args.runs_root, f"fold_{fold}")
+@torch.no_grad()
+def validate(model, loader, loss_func, dice_metric, post_pred, post_label, device, args):
+    model.eval()
+    dice_metric.reset()
+    val_loss = 0.0
+    steps = 0
+
+    for batch_data in loader:
+        steps += 1
+        images = batch_data["image"].to(device)
+        labels = batch_data["label"].to(device)
+
+        logits = sliding_window_inference(
+            inputs=images,
+            roi_size=(args.roi_x, args.roi_y, args.roi_z),
+            sw_batch_size=args.sw_batch_size,
+            predictor=model,
+            overlap=args.infer_overlap,
+        )
+        val_loss += loss_func(logits, labels).item()
+        preds_list = [post_pred(x) for x in decollate_batch(logits)]
+        labels_list = [post_label(x) for x in decollate_batch(labels)]
+        dice_metric(y_pred=preds_list, y=labels_list)
+
+    mean_dice = dice_metric.aggregate().item()
+    dice_metric.reset()
+    return val_loss / max(steps, 1), mean_dice
+
+
+def save_case_list(file_list, save_path):
+    with open(save_path, "w", encoding="utf-8") as f:
+        for item in file_list:
+            f.write(item["case_id"] + "\n")
+
+
+def train_one_fold(fold_idx: int, train_files, val_files, args, device):
+    fold_dir = os.path.join(args.runs_root, f"fold_{fold_idx}")
     os.makedirs(fold_dir, exist_ok=True)
-    checkpoint_path = os.path.join(fold_dir, f"best_model_fold{fold}.pth")
-    epoch_log_path = os.path.join(fold_dir, "epoch_metrics.csv")
-    last_state_path = os.path.join(fold_dir, f"last_state_fold{fold}.pt")
+    print("=" * 80, flush=True)
+    print(f"Start Fold {fold_idx}", flush=True)
+    print(f"Train cases: {len(train_files)} | Val cases: {len(val_files)}", flush=True)
+    print("=" * 80, flush=True)
+    save_case_list(train_files, os.path.join(fold_dir, "train_cases.txt"))
+    save_case_list(val_files, os.path.join(fold_dir, "val_cases.txt"))
 
-    train_transforms, val_transforms = build_transforms(args)
-    train_ds = Dataset(train_files, train_transforms)
-    val_ds = Dataset(val_files, val_transforms)
+    train_tf, val_tf = get_transforms(args)
+    train_ds = Dataset(data=train_files, transform=train_tf)
+    val_ds = Dataset(data=val_files, transform=val_tf)
+
+    g = torch.Generator()
+    g.manual_seed(args.seed + fold_idx)
 
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.train_workers,
+        num_workers=args.num_workers,
         pin_memory=pin_memory,
-        collate_fn=pad_list_data_collate,
+        collate_fn=list_data_collate,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=1,
         shuffle=False,
-        num_workers=args.val_workers,
+        num_workers=args.num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
 
-    model = build_model(device)
-    loss_function = DiceCELoss(sigmoid=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=max(3, args.early_stop_patience // 3),
-        min_lr=1e-6,
-    )
+    model = AttentionUNet3D(
+        in_channels=1,
+        out_channels=1,
+        features=(args.f1, args.f2, args.f3, args.f4, args.f5),
+    ).to(device)
 
-    use_amp = bool(args.amp and device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    loss_func = DiceCELoss(sigmoid=True, squared_pred=True, reduction="mean", lambda_dice=1.0, lambda_ce=1.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epochs, eta_min=args.eta_min)
 
-    best_metric = -1.0
+    dice_metric = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
+    post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+    post_label = Compose([AsDiscrete(threshold=0.5)])
+
+    log_path = os.path.join(fold_dir, "epoch_metrics.csv")
+    best_path = os.path.join(fold_dir, f"best_model_fold{fold_idx}.pth")
+    last_state_path = os.path.join(fold_dir, f"last_state_fold{fold_idx}.pt")
+
+    best_dice = -1.0
     best_epoch = -1
     epochs_no_improve = 0
-    start_epoch = 0
-    roi_size = (args.roi_x, args.roi_y, args.roi_z)
+    start_epoch = 1
 
     if args.resume and os.path.exists(last_state_path):
         state = torch.load(last_state_path, map_location=device)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
-        if "scaler" in state and state["scaler"] is not None:
-            scaler.load_state_dict(state["scaler"])
-        start_epoch = int(state["epoch"]) + 1
-        best_metric = float(state["best_metric"])
-        best_epoch = int(state["best_epoch"])
-        epochs_no_improve = int(state["epochs_no_improve"])
-        print(
-            f"Resume fold {fold} from epoch {start_epoch + 1} | "
-            f"best_dice_fg={best_metric:.4f}"
-        )
+        best_dice = float(state.get("best_dice", -1.0))
+        best_epoch = int(state.get("best_epoch", -1))
+        epochs_no_improve = int(state.get("epochs_no_improve", 0))
+        start_epoch = int(state.get("epoch", 0)) + 1
+        print(f"Resume fold {fold_idx} from epoch {start_epoch}")
 
-    log_mode = "a" if (args.resume and os.path.exists(epoch_log_path) and start_epoch > 0) else "w"
-    with open(epoch_log_path, log_mode, newline="", encoding="utf-8") as f:
+    log_mode = "a" if (args.resume and os.path.exists(log_path) and start_epoch > 1) else "w"
+    with open(log_path, log_mode, newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if log_mode == "w":
-            writer.writerow(["epoch", "train_loss", "val_dice_fg", "lr", "is_best"])
+            writer.writerow(["epoch", "train_loss", "val_loss", "val_dice_fg", "lr", "is_best"])
 
-        for epoch in range(start_epoch, args.max_epochs):
-            model.train()
-            train_loss = 0.0
-            optimizer.zero_grad(set_to_none=True)
-
-            for step, batch in enumerate(train_loader, start=1):
-                inputs = batch["image"].to(device)
-                labels = batch["label"].to(device)
-
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    outputs = model(inputs)
-                    loss = loss_function(outputs, labels)
-                    loss_for_backward = loss / max(args.accumulate_steps, 1)
-                scaler.scale(loss_for_backward).backward()
-
-                if step % max(args.accumulate_steps, 1) == 0 or step == len(train_loader):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-
-                train_loss += loss.item()
-
-            train_loss = train_loss / max(len(train_loader), 1)
-
-            model.eval()
-            val_dice_sum = 0.0
-            val_dice_count = 0
-            with torch.no_grad():
-                for val_batch in val_loader:
-                    val_inputs = val_batch["image"].to(device)
-                    val_labels = val_batch["label"].to(device)
-
-                    val_outputs = sliding_window_inference(
-                        val_inputs, roi_size=roi_size, sw_batch_size=1, predictor=model
-                    )
-                    val_outputs = torch.sigmoid(val_outputs)
-                    val_outputs = (val_outputs > 0.5).float()
-                    batch_dice = compute_binary_dice(val_outputs, val_labels)
-                    val_dice_sum += float(batch_dice.item())
-                    val_dice_count += 1
-
-            metric = val_dice_sum / max(val_dice_count, 1)
-            if math.isnan(metric):
-                metric = 0.0
-            scheduler.step(metric)
+        for epoch in range(start_epoch, args.max_epochs + 1):
+            print(f"[Fold {fold_idx}] Epoch {epoch}/{args.max_epochs} start...", flush=True)
+            train_loss = train_one_epoch(model, train_loader, optimizer, loss_func, device, args, fold_idx, epoch, args.max_epochs)
+            print(f"[Fold {fold_idx}] Epoch {epoch}/{args.max_epochs} validation...", flush=True)
+            val_loss, val_dice = validate(model, val_loader, loss_func, dice_metric, post_pred, post_label, device, args)
 
             lr_now = optimizer.param_groups[0]["lr"]
-            is_best = int(metric > best_metric)
-            writer.writerow([epoch + 1, f"{train_loss:.6f}", f"{metric:.6f}", f"{lr_now:.8f}", is_best])
+            scheduler.step()
+
+            is_best = int(val_dice > best_dice)
+            writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}", f"{lr_now:.8f}", is_best])
             f.flush()
 
             print(
-                f"Fold {fold} | Epoch {epoch + 1}/{args.max_epochs} | "
-                f"Loss {train_loss:.4f} | Val Dice(FG) {metric:.4f} | LR {lr_now:.2e}"
+                f"Fold {fold_idx} | Epoch {epoch}/{args.max_epochs} | "
+                f"Train {train_loss:.4f} | ValLoss {val_loss:.4f} | ValDice {val_dice:.4f} | LR {lr_now:.2e}"
             )
 
             if is_best:
-                best_metric = metric
-                best_epoch = epoch + 1
+                best_dice = val_dice
+                best_epoch = epoch
                 epochs_no_improve = 0
-                torch.save(model.state_dict(), checkpoint_path)
-                print(f"Saved best model to: {checkpoint_path}")
+                torch.save(
+                    {
+                        "fold": fold_idx,
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "best_dice": best_dice,
+                        "best_epoch": best_epoch,
+                        "args": vars(args),
+                    },
+                    best_path,
+                )
             else:
                 epochs_no_improve += 1
 
             torch.save(
                 {
+                    "fold": fold_idx,
                     "epoch": epoch,
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict() if use_amp else None,
-                    "best_metric": best_metric,
+                    "best_dice": best_dice,
                     "best_epoch": best_epoch,
                     "epochs_no_improve": epochs_no_improve,
+                    "args": vars(args),
                 },
                 last_state_path,
             )
 
             if epochs_no_improve >= args.early_stop_patience:
-                print(f"Early stopping on fold {fold} at epoch {epoch + 1}")
+                print(f"Early stopping on fold {fold_idx} at epoch {epoch}")
                 break
 
     return {
-        "fold": fold,
+        "fold": fold_idx,
         "best_epoch": best_epoch,
-        "best_dice_fg": best_metric,
+        "best_dice_fg": best_dice,
         "num_train": len(train_files),
         "num_val": len(val_files),
-        "checkpoint": checkpoint_path,
+        "checkpoint": best_path,
     }
 
 
 def main():
     args = parse_args()
     os.makedirs(args.runs_root, exist_ok=True)
+    set_seed(args.seed)
 
-    set_all_seeds(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data_dicts = build_data_dicts(args.data_root)
+    data_list = collect_data_list(args.data_root)
+    if len(data_list) < args.num_folds:
+        raise RuntimeError(f"Number of cases {len(data_list)} is smaller than num_folds {args.num_folds}.")
 
-    if len(data_dicts) < args.num_folds:
-        raise ValueError(
-            f"Not enough samples ({len(data_dicts)}) for num_folds={args.num_folds}. "
-            "Please reduce num_folds or add more training cases."
-        )
+    splits = make_kfold_splits(data_list, args.num_folds, args.seed)
+    all_results = []
 
-    print("=" * 88)
-    print("AttentionUNet Training")
-    print(f"Device: {device}")
-    print(f"Cases: {len(data_dicts)}")
-    print(f"Folds: {args.num_folds}")
-    print(f"Runs root: {args.runs_root}")
-    print("=" * 88)
-
-    kf = KFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
-    fold_results = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(data_dicts)):
-        if args.only_fold is not None and fold != args.only_fold:
+    for fold_idx, (train_files, val_files) in enumerate(splits):
+        if args.only_fold is not None and fold_idx != args.only_fold:
             continue
+        result = train_one_fold(fold_idx, train_files, val_files, args, device)
+        all_results.append(result)
 
-        print(f"\n===== Fold {fold} =====")
-        train_files = [data_dicts[i] for i in train_idx]
-        val_files = [data_dicts[i] for i in val_idx]
-        fold_dir = os.path.join(args.runs_root, f"fold_{fold}")
-        os.makedirs(fold_dir, exist_ok=True)
-        with open(os.path.join(fold_dir, "train_cases.txt"), "w", encoding="utf-8") as f:
-            for d in train_files:
-                f.write(f"{d['case_id']}\n")
-        with open(os.path.join(fold_dir, "val_cases.txt"), "w", encoding="utf-8") as f:
-            for d in val_files:
-                f.write(f"{d['case_id']}\n")
-
-        result = train_one_fold(fold, train_files, val_files, args, device)
-        fold_results.append(result)
-        print(
-            f"Fold {fold} done | best_epoch={result['best_epoch']} | "
-            f"best_dice_fg={result['best_dice_fg']:.4f}"
-        )
-
-    if not fold_results:
+    if not all_results:
         raise ValueError("No fold was trained. Check --only_fold setting.")
 
     summary_path = os.path.join(args.runs_root, "cv_results.csv")
-    merged = {}
-    if os.path.exists(summary_path):
-        with open(summary_path, "r", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                merged[int(row["fold"])] = row
-    for r in fold_results:
-        merged[int(r["fold"])] = {
-            "fold": str(r["fold"]),
-            "best_epoch": str(r["best_epoch"]),
-            "best_dice_fg": f"{r['best_dice_fg']:.6f}",
-            "num_train": str(r["num_train"]),
-            "num_val": str(r["num_val"]),
-            "checkpoint": r["checkpoint"],
-        }
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = ["fold", "best_epoch", "best_dice_fg", "num_train", "num_val", "checkpoint"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=["fold", "best_epoch", "best_dice_fg", "num_train", "num_val", "checkpoint"])
         writer.writeheader()
-        for fold in sorted(merged.keys()):
-            writer.writerow(merged[fold])
+        for r in sorted(all_results, key=lambda x: x["fold"]):
+            writer.writerow(
+                {
+                    "fold": r["fold"],
+                    "best_epoch": r["best_epoch"],
+                    "best_dice_fg": f"{r['best_dice_fg']:.6f}",
+                    "num_train": r["num_train"],
+                    "num_val": r["num_val"],
+                    "checkpoint": r["checkpoint"],
+                }
+            )
 
-    best_scores = np.array([float(merged[k]["best_dice_fg"]) for k in sorted(merged.keys())], dtype=np.float32)
+    scores = np.array([r["best_dice_fg"] for r in all_results], dtype=np.float32)
     print("\n===== Cross-Validation Summary =====")
     print(f"Saved summary: {summary_path}")
-    print(f"Dice(FG) mean={best_scores.mean():.4f}, std={best_scores.std(ddof=0):.4f}")
+    print(f"Dice(FG) mean={scores.mean():.4f}, std={scores.std(ddof=0):.4f}")
 
 
 if __name__ == "__main__":

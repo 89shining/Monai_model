@@ -16,23 +16,29 @@ SAVE_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/Networks/AttentionUNet/EsoCTV_
 RUNS_ROOT = os.path.join(SAVE_ROOT, "TrainResults")
 PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 
-CUDA_VISIBLE_DEVICES = "0"   # e.g. "0" / "1" / "0,1"
+CUDA_VISIBLE_DEVICES = "0"
 
 NUM_FOLDS = 5
 MAX_EPOCHS = 200
-EARLY_STOP_PATIENCE = 30
-TRAIN_BATCH_SIZE = 4
+EARLY_STOP_PATIENCE = 40
+TRAIN_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 LR = 1e-4
-SEED = 42
-TRAIN_WORKERS = 4
-VAL_WORKERS = 2
-TEST_WORKERS = 2
-ROI_X, ROI_Y, ROI_Z = 96, 96, 96
+ETA_MIN = 1e-6
+WEIGHT_DECAY = 1e-5
+GRAD_CLIP = 12.0
+SEED = 2026
+NUM_WORKERS = 0
+ROI_X, ROI_Y, ROI_Z = 96, 96, 64
+NUM_SAMPLES = 4
+SW_BATCH_SIZE = 2
+INFER_OVERLAP = 0.5
 THRESHOLD = 0.5
-ACCUMULATE_STEPS = 4
-USE_AMP = True
+A_MIN, A_MAX = -160.0, 240.0
+PIXDIM_X, PIXDIM_Y, PIXDIM_Z = 1.0, 1.0, 1.0
+AXCODES = "RAS"
 
+F1, F2, F3, F4, F5 = 32, 64, 128, 256, 512
 AUTO_RESUME = True
 # =========================
 
@@ -49,7 +55,6 @@ def read_best_from_fold_epoch_csv(fold_dir: str):
 
     with open(epoch_csv, "r", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-
     if not rows:
         raise ValueError(f"No rows in: {epoch_csv}")
 
@@ -145,10 +150,21 @@ def write_cv_results(runs_root: str, num_folds: int, seed: int, data_root: str):
             r["best_dice_fg"] = f"{r['best_dice_fg']:.6f}"
             writer.writerow(r)
 
-    best_row = max(rows, key=lambda x: x["best_dice_fg"])
-    print("\n===== CV Summary =====")
-    print(f"Saved: {cv_path}")
-    print(f"Best fold: {best_row['fold']} (DiceFG={best_row['best_dice_fg']:.4f})")
+
+
+
+def read_cv_results(cv_path: str):
+    with open(cv_path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"No rows in: {cv_path}")
+    return rows
+
+
+def pick_best_fold(cv_path: str) -> int:
+    rows = read_cv_results(cv_path)
+    best = max(rows, key=lambda r: float(r["best_dice_fg"]))
+    return int(best["fold"])
 
 
 def main():
@@ -173,39 +189,38 @@ def main():
         cmd = [
             sys.executable,
             train_py,
-            "--data_root",
-            DATA_ROOT,
-            "--runs_root",
-            RUNS_ROOT,
-            "--num_folds",
-            str(NUM_FOLDS),
-            "--max_epochs",
-            str(MAX_EPOCHS),
-            "--early_stop_patience",
-            str(EARLY_STOP_PATIENCE),
-            "--batch_size",
-            str(TRAIN_BATCH_SIZE),
-            "--lr",
-            str(LR),
-            "--seed",
-            str(SEED),
-            "--train_workers",
-            str(TRAIN_WORKERS),
-            "--val_workers",
-            str(VAL_WORKERS),
-            "--roi_x",
-            str(ROI_X),
-            "--roi_y",
-            str(ROI_Y),
-            "--roi_z",
-            str(ROI_Z),
-            "--accumulate_steps",
-            str(ACCUMULATE_STEPS),
-            "--only_fold",
-            str(fold),
+            "--data_root", DATA_ROOT,
+            "--runs_root", RUNS_ROOT,
+            "--num_folds", str(NUM_FOLDS),
+        "--fold", str(best_fold),
+            "--seed", str(SEED),
+            "--max_epochs", str(MAX_EPOCHS),
+            "--early_stop_patience", str(EARLY_STOP_PATIENCE),
+            "--batch_size", str(TRAIN_BATCH_SIZE),
+            "--num_workers", str(NUM_WORKERS),
+            "--lr", str(LR),
+            "--eta_min", str(ETA_MIN),
+            "--weight_decay", str(WEIGHT_DECAY),
+            "--grad_clip", str(GRAD_CLIP),
+            "--roi_x", str(ROI_X),
+            "--roi_y", str(ROI_Y),
+            "--roi_z", str(ROI_Z),
+            "--num_samples", str(NUM_SAMPLES),
+            "--sw_batch_size", str(SW_BATCH_SIZE),
+            "--infer_overlap", str(INFER_OVERLAP),
+            "--a_min", str(A_MIN),
+            "--a_max", str(A_MAX),
+            "--pixdim_x", str(PIXDIM_X),
+            "--pixdim_y", str(PIXDIM_Y),
+            "--pixdim_z", str(PIXDIM_Z),
+            "--axcodes", AXCODES,
+            "--f1", str(F1),
+            "--f2", str(F2),
+            "--f3", str(F3),
+            "--f4", str(F4),
+            "--f5", str(F5),
+            "--only_fold", str(fold),
         ]
-        if USE_AMP:
-            cmd.append("--amp")
         if AUTO_RESUME:
             cmd.append("--resume")
         run_cmd(cmd, env)
@@ -216,27 +231,36 @@ def main():
 
     write_cv_results(RUNS_ROOT, NUM_FOLDS, SEED, DATA_ROOT)
 
+    cv_path = os.path.join(RUNS_ROOT, "cv_results.csv")
+    best_fold = pick_best_fold(cv_path)
+    print(f"[Test] Use best fold: {best_fold} from {cv_path}")
+
     test_cmd = [
         sys.executable,
         test_py,
-        "--data_root",
-        DATA_ROOT,
-        "--runs_root",
-        RUNS_ROOT,
-        "--save_dir",
-        PRED_SAVE_DIR,
-        "--batch_size",
-        str(TEST_BATCH_SIZE),
-        "--workers",
-        str(TEST_WORKERS),
-        "--roi_x",
-        str(ROI_X),
-        "--roi_y",
-        str(ROI_Y),
-        "--roi_z",
-        str(ROI_Z),
-        "--threshold",
-        str(THRESHOLD),
+        "--data_root", DATA_ROOT,
+        "--runs_root", RUNS_ROOT,
+        "--save_dir", PRED_SAVE_DIR,
+        "--batch_size", str(TEST_BATCH_SIZE),
+        "--workers", str(NUM_WORKERS),
+        "--roi_x", str(ROI_X),
+        "--roi_y", str(ROI_Y),
+        "--roi_z", str(ROI_Z),
+        "--sw_batch_size", str(SW_BATCH_SIZE),
+        "--infer_overlap", str(INFER_OVERLAP),
+        "--threshold", str(THRESHOLD),
+        "--num_folds", str(NUM_FOLDS),
+        "--a_min", str(A_MIN),
+        "--a_max", str(A_MAX),
+        "--pixdim_x", str(PIXDIM_X),
+        "--pixdim_y", str(PIXDIM_Y),
+        "--pixdim_z", str(PIXDIM_Z),
+        "--axcodes", AXCODES,
+        "--f1", str(F1),
+        "--f2", str(F2),
+        "--f3", str(F3),
+        "--f4", str(F4),
+        "--f5", str(F5),
     ]
     run_cmd(test_cmd, env)
 

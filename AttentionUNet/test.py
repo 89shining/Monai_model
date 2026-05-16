@@ -6,24 +6,53 @@ import SimpleITK as sitk
 import torch
 from monai.data import DataLoader, Dataset
 from monai.inferers import sliding_window_inference
-from monai.networks.nets import AttentionUnet
-from monai.transforms import Compose, EnsureChannelFirstd, EnsureTyped, Lambdad, LoadImaged, ScaleIntensityRanged
+from monai.transforms import (
+    Compose,
+    EnsureChannelFirstd,
+    EnsureTyped,
+    Lambdad,
+    LoadImaged,
+    Orientationd,
+    ScaleIntensityRanged,
+    Spacingd,
+)
+
+from train import AttentionUNet3D
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AttentionUNet testing with 5-fold ensemble.")
-    parser.add_argument("--data_root", type=str, required=True, help="Dataset root directory.")
-    parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet", help="Training runs root.")
-    parser.add_argument("--save_dir", type=str, default="./predictions", help="Prediction output directory.")
-    parser.add_argument("--batch_size", type=int, default=1, help="Inference batch size.")
-    parser.add_argument("--workers", type=int, default=2, help="Dataloader workers.")
-    parser.add_argument("--roi_x", type=int, default=96, help="Sliding-window ROI x.")
-    parser.add_argument("--roi_y", type=int, default=96, help="Sliding-window ROI y.")
-    parser.add_argument("--roi_z", type=int, default=96, help="Sliding-window ROI z.")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Sigmoid threshold.")
-    parser.add_argument("--num_folds", type=int, default=5, help="Number of folds for ensemble loading.")
-    parser.add_argument("--fold", type=int, default=None, help="Force single fold inference and disable ensemble.")
+    parser = argparse.ArgumentParser(description="AttentionUNet testing with fold ensemble.")
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet")
+    parser.add_argument("--save_dir", type=str, default="./predictions")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--roi_x", type=int, default=96)
+    parser.add_argument("--roi_y", type=int, default=96)
+    parser.add_argument("--roi_z", type=int, default=64)
+    parser.add_argument("--sw_batch_size", type=int, default=2)
+    parser.add_argument("--infer_overlap", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--num_folds", type=int, default=5)
+    parser.add_argument("--fold", type=int, default=None)
+
+    parser.add_argument("--a_min", type=float, default=-160.0)
+    parser.add_argument("--a_max", type=float, default=240.0)
+    parser.add_argument("--pixdim_x", type=float, default=1.0)
+    parser.add_argument("--pixdim_y", type=float, default=1.0)
+    parser.add_argument("--pixdim_z", type=float, default=1.0)
+    parser.add_argument("--axcodes", type=str, default="RAS")
+
+    parser.add_argument("--f1", type=int, default=32)
+    parser.add_argument("--f2", type=int, default=64)
+    parser.add_argument("--f3", type=int, default=128)
+    parser.add_argument("--f4", type=int, default=256)
+    parser.add_argument("--f5", type=int, default=512)
     return parser.parse_args()
+
+
+def _binarize_label(x):
+    return (x > 0).astype(x.dtype)
 
 
 def strip_nii_ext(filename: str) -> str:
@@ -45,13 +74,9 @@ def label_case_id(path: str) -> str:
     return strip_nii_ext(os.path.basename(path))
 
 
-def _binarize_label(x):
-    return (x > 0).astype(x.dtype)
-
-
 def build_test_data(data_root: str):
-    images = sorted(glob.glob(os.path.join(data_root, "imagesTs", "*_0000.nii.gz")))
-    labels = sorted(glob.glob(os.path.join(data_root, "labelsTs", "*.nii.gz")))
+    images = sorted(glob.glob(os.path.join(data_root, "imagesTs", "*_0000.nii.gz")) + glob.glob(os.path.join(data_root, "imagesTs", "*_0000.nii")))
+    labels = sorted(glob.glob(os.path.join(data_root, "labelsTs", "*.nii.gz")) + glob.glob(os.path.join(data_root, "labelsTs", "*.nii")))
 
     if not images:
         raise FileNotFoundError(f"No test images found under: {os.path.join(data_root, 'imagesTs')}")
@@ -75,20 +100,22 @@ def build_test_data(data_root: str):
     return [{"image": image_map[cid], "label": label_map[cid]} for cid in case_ids]
 
 
-def load_model(runs_root: str, fold: int, device: torch.device):
+def load_model(runs_root: str, fold: int, device: torch.device, args):
     model_path = os.path.join(runs_root, f"fold_{fold}", f"best_model_fold{fold}.pth")
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    model = AttentionUnet(
-        spatial_dims=3,
+    model = AttentionUNet3D(
         in_channels=1,
         out_channels=1,
-        channels=(16, 32, 64, 128, 256),
-        strides=(2, 2, 2, 2),
+        features=(args.f1, args.f2, args.f3, args.f4, args.f5),
     ).to(device)
+
     state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state)
+    if isinstance(state, dict) and "model" in state:
+        model.load_state_dict(state["model"])
+    else:
+        model.load_state_dict(state)
     model.eval()
     return model, model_path
 
@@ -102,18 +129,25 @@ def main():
     models = []
     model_paths = []
     for fold in folds:
-        model, model_path = load_model(args.runs_root, fold, device)
+        model, model_path = load_model(args.runs_root, fold, device, args)
         models.append(model)
         model_paths.append(model_path)
 
-    data_dicts = build_test_data(args.data_root)
     test_transforms = Compose([
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
-        ScaleIntensityRanged(keys="image", a_min=-160.0, a_max=240.0, b_min=0.0, b_max=1.0, clip=True),
+        Orientationd(keys=["image", "label"], axcodes=args.axcodes),
+        Spacingd(
+            keys=["image", "label"],
+            pixdim=(args.pixdim_x, args.pixdim_y, args.pixdim_z),
+            mode=("bilinear", "nearest"),
+        ),
+        ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
         Lambdad(keys="label", func=_binarize_label),
         EnsureTyped(keys=["image", "label"]),
     ])
+
+    data_dicts = build_test_data(args.data_root)
     test_ds = Dataset(data_dicts, test_transforms)
     test_loader = DataLoader(
         test_ds,
@@ -134,10 +168,15 @@ def main():
     with torch.no_grad():
         for batch in test_loader:
             image = batch["image"].to(device)
-
             prob_sum = None
             for model in models:
-                logits = sliding_window_inference(image, roi_size=roi_size, sw_batch_size=1, predictor=model)
+                logits = sliding_window_inference(
+                    image,
+                    roi_size=roi_size,
+                    sw_batch_size=args.sw_batch_size,
+                    predictor=model,
+                    overlap=args.infer_overlap,
+                )
                 probs = torch.sigmoid(logits)
                 prob_sum = probs if prob_sum is None else (prob_sum + probs)
 
@@ -147,14 +186,12 @@ def main():
             bs = output.shape[0]
             for i in range(bs):
                 pred = output[i, 0].cpu().numpy().astype("uint8")
-
                 image_path = batch["image_meta_dict"]["filename_or_obj"][i]
                 label_path = batch["label_meta_dict"]["filename_or_obj"][i]
                 save_name = os.path.basename(label_path)
 
                 itk_img = sitk.ReadImage(image_path)
                 pred_itk = sitk.GetImageFromArray(pred)
-                # Keep shape/spacing/origin/direction exactly aligned to original CT geometry.
                 pred_itk.CopyInformation(itk_img)
 
                 out_path = os.path.join(args.save_dir, save_name)

@@ -135,6 +135,19 @@ class DiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
+class DiceBCELoss(nn.Module):
+    def __init__(self, smooth: float = 1e-6, bce_weight: float = 1.0, dice_weight: float = 1.0):
+        super().__init__()
+        self.dice = DiceLoss(smooth=smooth)
+        self.bce = nn.BCELoss()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target = target.float()
+        return self.dice_weight * self.dice(pred, target) + self.bce_weight * self.bce(pred, target)
+
+
 if __name__ == "__main__":
     # quick shape check
     model = DDUNet2D(in_channels=1, out_channels=1)
