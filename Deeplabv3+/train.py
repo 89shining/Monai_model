@@ -1,57 +1,37 @@
-﻿import csv
+import argparse
+import csv
 import glob
 import os
 import random
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Tuple
 
+import cv2
 import numpy as np
 import SimpleITK as sitk
 import torch
-import torch.nn as nn
-from monai.transforms import Compose, EnsureTyped, RandAffined, RandFlipd, RandGaussianNoised, RandScaleIntensityd, RandShiftIntensityd
+import torch.nn.functional as F
+from sklearn.model_selection import KFold
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from nets.deeplabv3_plus import DeepLab
 
 
+WINDOW_WIDTH = 400.0
+WINDOW_LEVEL = 40.0
+WINDOW_MIN = WINDOW_LEVEL - WINDOW_WIDTH / 2.0
+WINDOW_MAX = WINDOW_LEVEL + WINDOW_WIDTH / 2.0
+
+
 @dataclass
-class Config:
-    data_root: str = "/home/wusi/Project_crop/Data/Rectal_146/RectalCTV_All"
-    save_root: str = "/home/wusi/Project_crop/Data/Rectal_146/Networks/DeepLabV3Plus/RectalCTV_All/TrainResults"
-    fold: int = 0
-    num_folds: int = 5
-    seed: int = 42
-
-    epochs: int = 100
-    early_stopping_patience: int = 15
-    batch_size: int = 8
-    num_workers: int = 0
-
-    lr: float = 1e-4
-    eta_min: float = 1e-6
-    weight_decay: float = 1e-5
-    grad_clip: float = 1.0
-
-    pos_weight: float = 50.0
-    eval_threshold: float = 0.5
-
-    a_min: float = -160.0
-    a_max: float = 240.0
-    input_h: int = 512
-    input_w: int = 512
-
-    backbone: str = "xception"
-    downsample_factor: int = 16
-    num_classes: int = 1
-    pretrained: bool = False
-    model_path: str = "model_data/xception_pytorch_imagenet.pth"
-    resume: bool = True
-    debug: bool = True
+class CaseData:
+    case_id: str
+    image_path: str
+    label_path: str
 
 
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -60,358 +40,315 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def strip_nii_ext(filename: str) -> str:
-    if filename.endswith('.nii.gz'):
-        return filename[:-7]
-    if filename.endswith('.nii'):
-        return filename[:-4]
-    return os.path.splitext(filename)[0]
+def strip_nii_ext(name: str) -> str:
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    if name.endswith(".nii"):
+        return name[:-4]
+    return os.path.splitext(name)[0]
 
 
-def case_id_from_image(path: str) -> str:
-    n = strip_nii_ext(os.path.basename(path))
-    return n[:-5] if n.endswith('_0000') else n
+def image_case_id(path: str) -> str:
+    name = strip_nii_ext(os.path.basename(path))
+    return name[:-5] if name.endswith("_0000") else name
 
 
-def load_case_volumes(data_root: str, split: str = "imagesTr") -> Dict[str, str]:
-    image_dir = os.path.join(data_root, split)
-    images = sorted(glob.glob(os.path.join(image_dir, '*_0000.nii.gz')) + glob.glob(os.path.join(image_dir, '*_0000.nii')))
-    return {case_id_from_image(p): p for p in images}
+def collect_cases(data_root: str) -> List[CaseData]:
+    images = sorted(glob.glob(os.path.join(data_root, "imagesTr", "*.nii*")))
+    labels = sorted(glob.glob(os.path.join(data_root, "labelsTr", "*.nii*")))
+    if not images or not labels:
+        raise FileNotFoundError("imagesTr/labelsTr not found or empty.")
+
+    label_map = {strip_nii_ext(os.path.basename(p)): p for p in labels}
+    cases: List[CaseData] = []
+    for ip in images:
+        cid = image_case_id(ip)
+        if cid not in label_map:
+            raise FileNotFoundError(f"Missing label for case: {cid}")
+        cases.append(CaseData(case_id=cid, image_path=ip, label_path=label_map[cid]))
+    return sorted(cases, key=lambda x: x.case_id)
 
 
-def load_label_volumes(data_root: str, split: str = "labelsTr") -> Dict[str, str]:
-    label_dir = os.path.join(data_root, split)
-    labels = sorted(glob.glob(os.path.join(label_dir, '*.nii.gz')) + glob.glob(os.path.join(label_dir, '*.nii')))
-    return {strip_nii_ext(os.path.basename(p)): p for p in labels}
+def window_and_norm(arr: np.ndarray) -> np.ndarray:
+    arr = np.clip(arr, WINDOW_MIN, WINDOW_MAX)
+    arr = (arr - WINDOW_MIN) / (WINDOW_MAX - WINDOW_MIN)
+    return arr.astype(np.float32)
 
 
-def make_patient_splits(case_ids: List[str], num_folds: int, seed: int):
-    idx = list(range(len(case_ids)))
-    rng = np.random.RandomState(seed)
-    rng.shuffle(idx)
-    fold_sizes = [len(idx) // num_folds] * num_folds
-    for i in range(len(idx) % num_folds):
-        fold_sizes[i] += 1
-    folds = []
-    s = 0
-    for fs in fold_sizes:
-        folds.append(idx[s:s+fs])
-        s += fs
-    splits = []
-    for f in range(num_folds):
-        val_idx = folds[f]
-        train_idx = [j for i, fold in enumerate(folds) if i != f for j in fold]
-        splits.append(([case_ids[i] for i in train_idx], [case_ids[i] for i in val_idx]))
-    return splits
+class SliceDataset(Dataset):
+    def __init__(self, cases: List[CaseData], out_size: Tuple[int, int] = (512, 512), augment: bool = False):
+        self.out_size = out_size
+        self.augment = augment
+        self.slices = []
 
-
-def window_norm(slice2d: np.ndarray, a_min: float, a_max: float) -> np.ndarray:
-    x = np.clip(slice2d, a_min, a_max)
-    x = (x - a_min) / max(a_max - a_min, 1e-6)
-    return x.astype(np.float32)
-
-
-def resize2d(img: np.ndarray, h: int, w: int, mode: str) -> np.ndarray:
-    import cv2
-    interp = cv2.INTER_LINEAR if mode == "linear" else cv2.INTER_NEAREST
-    return cv2.resize(img, (w, h), interpolation=interp)
-
-
-class SliceTrainDataset(Dataset):
-    def __init__(self, case_ids: List[str], image_map: Dict[str, str], label_map: Dict[str, str], cfg: Config):
-        self.cfg = cfg
-        self.records = []
-        self.cache = {}
-        for cid in case_ids:
-            if cid not in image_map or cid not in label_map:
-                continue
-            vol = sitk.GetArrayFromImage(sitk.ReadImage(image_map[cid])).astype(np.float32)
-            lab = sitk.GetArrayFromImage(sitk.ReadImage(label_map[cid])).astype(np.float32)
-            if vol.shape != lab.shape:
-                continue
-            self.cache[cid] = (vol, (lab > 0).astype(np.float32))
-            for z in range(vol.shape[0]):
-                self.records.append((cid, z))
-
-        self.aug = Compose([
-            RandFlipd(keys=["image", "label"], spatial_axis=0, prob=0.5),
-            RandFlipd(keys=["image", "label"], spatial_axis=1, prob=0.5),
-            RandAffined(
-                keys=["image", "label"], prob=0.2,
-                rotate_range=(0.1,), scale_range=(0.1, 0.1),
-                mode=("bilinear", "nearest"), padding_mode="border"
-            ),
-            RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
-            RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.3),
-            RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.01),
-            EnsureTyped(keys=["image", "label"], dtype=torch.float32),
-        ])
+        for case in cases:
+            img = sitk.GetArrayFromImage(sitk.ReadImage(case.image_path)).astype(np.float32)
+            lab = sitk.GetArrayFromImage(sitk.ReadImage(case.label_path)).astype(np.float32)
+            if img.shape != lab.shape:
+                raise ValueError(f"Shape mismatch: {case.case_id}")
+            img = window_and_norm(img)
+            lab = (lab > 0).astype(np.float32)
+            for z in range(img.shape[0]):
+                self.slices.append((img[z], lab[z]))
 
     def __len__(self):
-        return len(self.records)
+        return len(self.slices)
+
+    @staticmethod
+    def rand(a=0.0, b=1.0) -> float:
+        return np.random.rand() * (b - a) + a
+
+    def augment_image_mask(self, img: np.ndarray, lab: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        h, w = self.out_size
+        ih, iw = img.shape
+
+        jitter = 0.3
+        new_ar = (iw / max(ih, 1)) * self.rand(1 - jitter, 1 + jitter) / self.rand(1 - jitter, 1 + jitter)
+        scale = self.rand(0.25, 2.0)
+        if new_ar < 1:
+            nh = int(scale * h)
+            nw = int(nh * new_ar)
+        else:
+            nw = int(scale * w)
+            nh = int(nw / new_ar)
+        nw = max(nw, 1)
+        nh = max(nh, 1)
+
+        img_rs = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        lab_rs = cv2.resize(lab, (nw, nh), interpolation=cv2.INTER_NEAREST)
+
+        canvas_img = np.zeros((h, w), dtype=np.float32)
+        canvas_lab = np.zeros((h, w), dtype=np.float32)
+        dx = int(self.rand(0, w - nw))
+        dy = int(self.rand(0, h - nh))
+        sx0 = max(0, -dx)
+        sy0 = max(0, -dy)
+        sx1 = min(nw, w - dx)
+        sy1 = min(nh, h - dy)
+        tx0 = max(0, dx)
+        ty0 = max(0, dy)
+        tx1 = tx0 + (sx1 - sx0)
+        ty1 = ty0 + (sy1 - sy0)
+        if sx1 > sx0 and sy1 > sy0:
+            canvas_img[ty0:ty1, tx0:tx1] = img_rs[sy0:sy1, sx0:sx1]
+            canvas_lab[ty0:ty1, tx0:tx1] = lab_rs[sy0:sy1, sx0:sx1]
+        img, lab = canvas_img, canvas_lab
+
+        if self.rand() < 0.5:
+            img = np.fliplr(img).copy()
+            lab = np.fliplr(lab).copy()
+
+        if self.rand() < 0.25:
+            img = cv2.GaussianBlur(img, (5, 5), 0)
+
+        if self.rand() < 0.25:
+            center = (w // 2, h // 2)
+            rotation = np.random.randint(-10, 11)
+            m = cv2.getRotationMatrix2D(center, -rotation, 1.0)
+            img = cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR, borderValue=0.0)
+            lab = cv2.warpAffine(lab, m, (w, h), flags=cv2.INTER_NEAREST, borderValue=0.0)
+
+        return img.astype(np.float32), (lab > 0.5).astype(np.float32)
 
     def __getitem__(self, idx):
-        cid, z = self.records[idx]
-        vol, lab = self.cache[cid]
-        img = window_norm(vol[z], self.cfg.a_min, self.cfg.a_max)
-        msk = lab[z]
-        img = resize2d(img, self.cfg.input_h, self.cfg.input_w, "linear")
-        msk = resize2d(msk, self.cfg.input_h, self.cfg.input_w, "nearest")
+        img, lab = self.slices[idx]
+        if self.augment:
+            img, lab = self.augment_image_mask(img, lab)
+            x = torch.from_numpy(img)[None, ...]
+            y = torch.from_numpy(lab)[None, ...]
+        else:
+            x = torch.from_numpy(img)[None, ...]
+            y = torch.from_numpy(lab)[None, ...]
+            x = F.interpolate(x[None, ...], size=self.out_size, mode="bilinear", align_corners=False)[0]
+            y = F.interpolate(y[None, ...], size=self.out_size, mode="nearest")[0]
+            y = (y > 0.5).float()
 
-        d = {"image": img[None, ...], "label": msk[None, ...]}
-        d = self.aug(d)
-        image = d["image"].repeat(3, 1, 1)
-        label = d["label"]
-        return image, label
-
-
-class SimpleBCELoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor, pos_weight: torch.Tensor):
-        return torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, target, pos_weight=pos_weight, reduction="mean"
-        )
+        x = x.repeat(3, 1, 1)
+        return x, y
 
 
-def patient_3d_dice(
-    model: nn.Module,
-    case_ids: List[str],
-    image_map: Dict[str, str],
-    label_map: Dict[str, str],
-    cfg: Config,
-    device: torch.device,
-) -> Tuple[float, float, float, float, float, float]:
-    model.eval()
-    hard_dices = []
-    best_hard_dices = []
-    best_thresholds = []
-    soft_dices = []
-    pred_fg_ratios = []
-    gt_fg_ratios = []
-    thr_grid = [0.10, 0.20, 0.30, 0.40, 0.50]
-    with torch.no_grad():
-        for cid in case_ids:
-            if cid not in image_map or cid not in label_map:
-                continue
-            vol = sitk.GetArrayFromImage(sitk.ReadImage(image_map[cid])).astype(np.float32)
-            lab = (sitk.GetArrayFromImage(sitk.ReadImage(label_map[cid])) > 0).astype(np.float32)
-            probs_vol = []
-            for z in range(vol.shape[0]):
-                img = window_norm(vol[z], cfg.a_min, cfg.a_max)
-                img = resize2d(img, cfg.input_h, cfg.input_w, "linear")
-                x = torch.from_numpy(img[None, None, ...]).float().to(device)
-                x = x.repeat(1, 3, 1, 1)
-                logits = model(x)
-                probs = torch.sigmoid(logits)
-                probs_vol.append(probs.cpu().numpy()[0, 0])
-            probs_vol = np.stack(probs_vol, axis=0)
-            probs_vol = np.stack([resize2d(s, lab.shape[1], lab.shape[2], "linear") for s in probs_vol], axis=0)
-
-            pred_vol = (probs_vol > cfg.eval_threshold).astype(np.float32)
-            inter = float((pred_vol * lab).sum())
-            den = float(pred_vol.sum() + lab.sum())
-            hard_dice = (2.0 * inter + 1e-6) / (den + 1e-6)
-
-            case_best_dice = -1.0
-            case_best_thr = cfg.eval_threshold
-            for thr in thr_grid:
-                pred_thr = (probs_vol > thr).astype(np.float32)
-                inter_thr = float((pred_thr * lab).sum())
-                den_thr = float(pred_thr.sum() + lab.sum())
-                dice_thr = (2.0 * inter_thr + 1e-6) / (den_thr + 1e-6)
-                if dice_thr > case_best_dice:
-                    case_best_dice = dice_thr
-                    case_best_thr = thr
-
-            soft_inter = float((probs_vol * lab).sum())
-            soft_den = float(probs_vol.sum() + lab.sum())
-            soft_dice = (2.0 * soft_inter + 1e-6) / (soft_den + 1e-6)
-            hard_dices.append(hard_dice)
-            best_hard_dices.append(case_best_dice)
-            best_thresholds.append(case_best_thr)
-            soft_dices.append(soft_dice)
-            pred_fg_ratios.append(float(pred_vol.mean()))
-            gt_fg_ratios.append(float(lab.mean()))
-    if not hard_dices:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, cfg.eval_threshold
-    return (
-        float(np.mean(hard_dices)),
-        float(np.mean(best_hard_dices)),
-        float(np.mean(soft_dices)),
-        float(np.mean(pred_fg_ratios)),
-        float(np.mean(gt_fg_ratios)),
-        float(np.mean(best_thresholds)),
-    )
+def dice_score_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> float:
+    pred = (torch.sigmoid(logits) > 0.5).float()
+    inter = (pred * target).sum(dim=(1, 2, 3))
+    den = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    dice = (2.0 * inter + eps) / (den + eps)
+    return dice.mean().item()
 
 
-def build_model(cfg: Config, device: torch.device) -> nn.Module:
-    model = DeepLab(num_classes=cfg.num_classes, backbone=cfg.backbone, downsample_factor=cfg.downsample_factor, pretrained=cfg.pretrained)
-    if cfg.model_path and os.path.exists(cfg.model_path):
-        state = torch.load(cfg.model_path, map_location=device)
-        model_dict = model.state_dict()
-        load_dict = {k: v for k, v in state.items() if k in model_dict and model_dict[k].shape == v.shape}
-        model_dict.update(load_dict)
-        model.load_state_dict(model_dict)
-    return model.to(device)
+def dice_bce_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    target = target.float()
+    probs = torch.sigmoid(logits)
+    p = probs.contiguous().view(probs.shape[0], -1)
+    t = target.contiguous().view(target.shape[0], -1)
+    inter = (p * t).sum(dim=1)
+    den = p.sum(dim=1) + t.sum(dim=1)
+    dice_loss = 1.0 - ((2.0 * inter + eps) / (den + eps))
+    dice_loss = dice_loss.mean()
+
+    bce_raw = torch.nn.functional.binary_cross_entropy(probs, target)
+    bce_norm = bce_raw / (1.0 + bce_raw)
+    return 0.5 * dice_loss + 0.5 * bce_norm
 
 
-def main():
-    cfg = Config()
-    cfg.fold = int(os.environ.get("DEEPLAB_FOLD", "0"))
-    cfg.data_root = os.environ.get("DEEPLAB_DATA_ROOT", cfg.data_root)
-    cfg.save_root = os.environ.get("DEEPLAB_SAVE_DIR", os.path.join(cfg.save_root, f"fold_{cfg.fold}"))
-    cfg.resume = os.environ.get("DEEPLAB_RESUME", "1").strip().lower() in {"1", "true", "yes", "y"}
-    cfg.debug = os.environ.get("DEEPLAB_DEBUG", "1").strip().lower() in {"1", "true", "yes", "y"}
-    os.makedirs(cfg.save_root, exist_ok=True)
+def build_model(backbone: str) -> nn.Module:
+    model_dir = os.path.join(os.path.dirname(__file__), "model_data")
+    pretrain_file = {
+        "xception": "xception_pytorch_imagenet.pth",
+        "mobilenet": "mobilenet_v2.pth.tar",
+    }[backbone]
+    has_local_pretrain = os.path.exists(os.path.join(model_dir, pretrain_file))
+    model = DeepLab(num_classes=1, backbone=backbone, pretrained=has_local_pretrain, downsample_factor=16)
+    if not has_local_pretrain:
+        print(f"[Info] Local pretrained not found ({pretrain_file}), skip pretrained init.")
+    return model
 
-    set_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    image_map = load_case_volumes(cfg.data_root, "imagesTr")
-    label_map = load_label_volumes(cfg.data_root, "labelsTr")
-    case_ids = sorted(set(image_map.keys()).intersection(set(label_map.keys())))
-    splits = make_patient_splits(case_ids, cfg.num_folds, cfg.seed)
-    train_ids, val_ids = splits[cfg.fold]
-    print(
-        f"[Split] fold={cfg.fold} | total_cases={len(case_ids)} | train_cases={len(train_ids)} | val_cases={len(val_ids)}",
-        flush=True,
-    )
+def run_fold(args, fold: int, train_cases: List[CaseData], val_cases: List[CaseData], device: torch.device) -> Tuple[int, float]:
+    fold_dir = os.path.join(args.runs_root, f"fold_{fold}")
+    os.makedirs(fold_dir, exist_ok=True)
+    latest_path = os.path.join(fold_dir, "latest.pth")
+    best_path = os.path.join(fold_dir, f"best_model_fold{fold}.pth")
+    metrics_csv = os.path.join(fold_dir, "epoch_metrics.csv")
 
-    train_ds = SliceTrainDataset(train_ids, image_map, label_map, cfg)
-    print(f"[Data] train_slices={len(train_ds)}", flush=True)
-    if len(val_ids) == 0:
-        raise RuntimeError(f"Validation set is empty for fold {cfg.fold}. Check num_folds or data_root.")
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=(device.type=="cuda"), drop_last=True)
+    train_ds = SliceDataset(train_cases, out_size=(512, 512), augment=True)
+    val_ds = SliceDataset(val_cases, out_size=(512, 512), augment=False)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda")
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
 
-    model = build_model(cfg, device)
-    loss_fn = SimpleBCELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.eta_min)
+    model = build_model(args.backbone).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    best_ckpt_path = os.path.join(cfg.save_root, f"best_model_fold{cfg.fold}.pth")
-    latest_ckpt_path = os.path.join(cfg.save_root, f"latest_model_fold{cfg.fold}.pth")
-    csv_path = os.path.join(cfg.save_root, "epoch_metrics.csv")
-
+    start_epoch = 0
     best_dice = -1.0
     best_epoch = -1
-    patience_count = 0
-    start_epoch = 1
-    log_rows = []
+    bad_epochs = 0
 
-    if cfg.resume and os.path.exists(latest_ckpt_path):
-        st = torch.load(latest_ckpt_path, map_location=device)
-        if isinstance(st, dict) and 'model' in st:
-            model.load_state_dict(st['model'])
-            if 'optimizer' in st:
-                optimizer.load_state_dict(st['optimizer'])
-            if 'scheduler' in st:
-                scheduler.load_state_dict(st['scheduler'])
-            best_dice = float(st.get('best_dice_fg', -1.0))
-            best_epoch = int(st.get('best_epoch', -1))
-            patience_count = int(st.get('patience_count', 0))
-            start_epoch = int(st.get('epoch', 0)) + 1
-        # resume existing csv rows if present
-        if os.path.exists(csv_path):
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                log_rows = list(csv.DictReader(f))
-        print(f"[Resume] fold={cfg.fold} from epoch {start_epoch}", flush=True)
+    if args.resume and os.path.exists(latest_path):
+        ckpt = torch.load(latest_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = int(ckpt["epoch"]) + 1
+        best_dice = float(ckpt["best_dice"])
+        best_epoch = int(ckpt["best_epoch"])
+        bad_epochs = int(ckpt["bad_epochs"])
+        print(f"[Resume] fold={fold}, start_epoch={start_epoch}")
 
-    for epoch in range(start_epoch, cfg.epochs + 1):
+    if start_epoch == 0:
+        with open(metrics_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch", "train_loss", "val_loss", "val_dice_fg"])
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        total_loss = 0.0
-        steps = 0
+        train_loss = 0.0
         for x, y in train_loader:
-            steps += 1
             x = x.to(device)
             y = y.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
-            pos_weight_t = torch.tensor([cfg.pos_weight], device=device, dtype=logits.dtype)
-            loss = loss_fn(logits, y, pos_weight_t)
+            loss = dice_bce_loss_from_logits(logits, y)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
-            total_loss += loss.item()
+            train_loss += loss.item()
+        train_loss /= max(len(train_loader), 1)
 
-        train_loss = total_loss / max(steps, 1)
-        val_dice, val_dice_best_thr, val_soft_dice, pred_fg_ratio, gt_fg_ratio, best_thr_mean = patient_3d_dice(
-            model, val_ids, image_map, label_map, cfg, device
-        )
-        lr_now = optimizer.param_groups[0]["lr"]
+        model.eval()
+        val_loss = 0.0
+        val_dice = 0.0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(device)
+                y = y.to(device)
+                logits = model(x)
+                val_loss += dice_bce_loss_from_logits(logits, y).item()
+                val_dice += dice_score_from_logits(logits, y)
+        val_loss /= max(len(val_loader), 1)
+        val_dice /= max(len(val_loader), 1)
         scheduler.step()
 
-        is_best = val_dice_best_thr > best_dice
-        if is_best:
-            best_dice = val_dice_best_thr
+        with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}"])
+
+        improved = val_dice > best_dice
+        if improved:
+            best_dice = val_dice
             best_epoch = epoch
-            patience_count = 0
-            ckpt = {
-                "model": model.state_dict(),
-                "epoch": epoch,
-                "best_dice_fg": best_dice,
-                "best_epoch": best_epoch,
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "config": cfg.__dict__,
-            }
-            torch.save(ckpt, best_ckpt_path)
+            bad_epochs = 0
+            torch.save({"model": model.state_dict(), "epoch": epoch, "best_dice": best_dice}, best_path)
         else:
-            patience_count += 1
+            bad_epochs += 1
 
         torch.save(
             {
                 "model": model.state_dict(),
-                "epoch": epoch,
-                "best_dice_fg": best_dice,
-                "best_epoch": best_epoch,
-                "patience_count": patience_count,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "config": cfg.__dict__,
+                "epoch": epoch,
+                "best_dice": best_dice,
+                "best_epoch": best_epoch,
+                "bad_epochs": bad_epochs,
             },
-            latest_ckpt_path,
+            latest_path,
         )
 
-        log_rows.append(
-            {
-                "epoch": epoch,
-                "train_loss": f"{train_loss:.6f}",
-                "val_dice_fg": f"{val_dice:.6f}",
-                "val_dice_best_thr": f"{val_dice_best_thr:.6f}",
-                "best_thr_mean": f"{best_thr_mean:.2f}",
-                "lr": f"{lr_now:.8f}",
-                "is_best": int(is_best),
-            }
-        )
         print(
-            f"Fold {cfg.fold} | Epoch {epoch}/{cfg.epochs} | TrainLoss {train_loss:.4f} | "
-            f"ValDice3D@{cfg.eval_threshold:.2f} {val_dice:.4f} | ValDice3D@BestThr {val_dice_best_thr:.4f} | LR {lr_now:.2e}",
+            f"Fold {fold} | Epoch {epoch + 1}/{args.epochs} | "
+            f"TrainLoss {train_loss:.4f} | ValLoss {val_loss:.4f} | ValDice {val_dice:.4f} | Best {best_dice:.4f}",
             flush=True,
         )
-        if cfg.debug:
-            print(
-                f"[Debug] Epoch {epoch} | SoftDice3D {val_soft_dice:.4f} | PredFG {pred_fg_ratio:.5f} | "
-                f"GTFG {gt_fg_ratio:.5f} | PosW {cfg.pos_weight:.2f} | BestThrMean {best_thr_mean:.2f}",
-                flush=True,
-            )
 
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(
-                f,
-                fieldnames=["epoch", "train_loss", "val_dice_fg", "val_dice_best_thr", "best_thr_mean", "lr", "is_best"],
-            )
-            w.writeheader()
-            for r in log_rows:
-                w.writerow(r)
-
-        with open(os.path.join(cfg.save_root, "best_dice.txt"), "w", encoding="utf-8") as f:
-            f.write(f"{best_dice:.6f}")
-
-        if patience_count >= cfg.early_stopping_patience:
-            print(f"Early stopping at epoch {epoch}, best epoch {best_epoch}, best dice {best_dice:.4f}", flush=True)
+        if bad_epochs >= args.early_stop:
+            print(f"[EarlyStop] fold={fold}, epoch={epoch}")
             break
+
+    return best_epoch, best_dice
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--runs_root", type=str, required=True)
+    p.add_argument("--fold", type=int, required=True)
+    p.add_argument("--num_folds", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--early_stop", type=int, default=15)
+    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--backbone", type=str, default="xception", choices=["xception", "mobilenet"])
+    p.add_argument("--resume", action="store_true")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cases = collect_cases(args.data_root)
+
+    kf = KFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
+    split = list(kf.split(cases))[args.fold]
+    train_idx, val_idx = split
+    train_cases = [cases[i] for i in train_idx]
+    val_cases = [cases[i] for i in val_idx]
+
+    os.makedirs(args.runs_root, exist_ok=True)
+    fold_dir = os.path.join(args.runs_root, f"fold_{args.fold}")
+    os.makedirs(fold_dir, exist_ok=True)
+
+    with open(os.path.join(fold_dir, "train_cases.txt"), "w", encoding="utf-8") as f:
+        for c in train_cases:
+            f.write(c.case_id + "\n")
+    with open(os.path.join(fold_dir, "val_cases.txt"), "w", encoding="utf-8") as f:
+        for c in val_cases:
+            f.write(c.case_id + "\n")
+
+    best_epoch, best_dice = run_fold(args, args.fold, train_cases, val_cases, device)
+    with open(os.path.join(fold_dir, "fold_done.flag"), "w", encoding="utf-8") as f:
+        f.write(f"best_epoch={best_epoch},best_dice={best_dice:.6f}\n")
 
 
 if __name__ == "__main__":

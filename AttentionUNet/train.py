@@ -1,17 +1,18 @@
-﻿import argparse
+import argparse
 import csv
 import glob
 import os
 import random
 from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from monai.data import DataLoader, Dataset, decollate_batch, list_data_collate
 from monai.inferers import sliding_window_inference
-from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.transforms import (
     Activations,
@@ -28,10 +29,12 @@ from monai.transforms import (
     RandGaussianNoised,
     RandScaleIntensityd,
     RandShiftIntensityd,
+    ResizeWithPadOrCropd,
     ScaleIntensityRanged,
     Spacingd,
     SpatialPadd,
 )
+from sklearn.model_selection import KFold
 
 
 def parse_args():
@@ -39,10 +42,10 @@ def parse_args():
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet")
     parser.add_argument("--num_folds", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--max_epochs", type=int, default=200)
-    parser.add_argument("--early_stop_patience", type=int, default=40)
+    parser.add_argument("--max_epochs", type=int, default=100)
+    parser.add_argument("--early_stop_patience", type=int, default=15)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -56,6 +59,7 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=4)
     parser.add_argument("--sw_batch_size", type=int, default=2)
     parser.add_argument("--infer_overlap", type=float, default=0.5)
+    parser.add_argument("--strong_aug", action="store_true")
 
     parser.add_argument("--a_min", type=float, default=-160.0)
     parser.add_argument("--a_max", type=float, default=240.0)
@@ -217,41 +221,61 @@ def collect_data_list(data_root: str) -> List[Dict[str, str]]:
 
 
 def make_kfold_splits(data_list: List[Dict[str, str]], num_folds: int, seed: int):
-    indices = list(range(len(data_list)))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-
-    fold_sizes = [len(indices) // num_folds] * num_folds
-    for i in range(len(indices) % num_folds):
-        fold_sizes[i] += 1
-
-    folds = []
-    start = 0
-    for fs in fold_sizes:
-        end = start + fs
-        folds.append(indices[start:end])
-        start = end
-
+    kf = KFold(n_splits=num_folds, shuffle=True, random_state=seed)
     splits = []
-    for fold_idx in range(num_folds):
-        val_indices = folds[fold_idx]
-        train_indices = []
-        for i in range(num_folds):
-            if i != fold_idx:
-                train_indices.extend(folds[i])
-        splits.append(([data_list[i] for i in train_indices], [data_list[i] for i in val_indices]))
+    for train_idx, val_idx in kf.split(data_list):
+        splits.append(([data_list[i] for i in train_idx], [data_list[i] for i in val_idx]))
     return splits
+
+
+def dice_bce_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    target = target.float()
+    probs = torch.sigmoid(logits)
+    p = probs.contiguous().view(probs.shape[0], -1)
+    t = target.contiguous().view(target.shape[0], -1)
+    inter = (p * t).sum(dim=1)
+    den = p.sum(dim=1) + t.sum(dim=1)
+    dice_loss = 1.0 - ((2.0 * inter + eps) / (den + eps))
+    dice_loss = dice_loss.mean()
+    bce_raw = F.binary_cross_entropy(probs, target)
+    bce_norm = bce_raw / (1.0 + bce_raw)
+    return 0.5 * dice_loss + 0.5 * bce_norm
+
+
+def save_loss_plot(csv_path: str, out_png: str) -> None:
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return
+        epochs = [int(r["epoch"]) for r in rows]
+        train_loss = [float(r["train_loss"]) for r in rows]
+        val_loss = [float(r["val_loss"]) for r in rows]
+        plt.figure(figsize=(7, 4))
+        plt.plot(epochs, train_loss, label="train_loss")
+        plt.plot(epochs, val_loss, label="val_loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Fold Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"[Warn] save_loss_plot failed: {e}", flush=True)
 
 
 def get_transforms(args):
     roi_size = (args.roi_x, args.roi_y, args.roi_z)
     pixdim = (args.pixdim_x, args.pixdim_y, args.pixdim_z)
 
-    train_transforms = Compose([
+    train_list = [
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
         Orientationd(keys=["image", "label"], axcodes=args.axcodes),
         Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+        ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=roi_size),
         ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
         Lambdad(keys=["label"], func=binarize_label),
         SpatialPadd(keys=["image", "label"], spatial_size=roi_size),
@@ -267,25 +291,50 @@ def get_transforms(args):
         ),
         RandFlipd(keys=["image", "label"], spatial_axis=0, prob=0.5),
         RandFlipd(keys=["image", "label"], spatial_axis=1, prob=0.5),
-        RandAffined(
-            keys=["image", "label"],
-            prob=0.2,
-            rotate_range=(0.1, 0.1, 0.05),
-            scale_range=(0.1, 0.1, 0.05),
-            mode=("bilinear", "nearest"),
-            padding_mode="border",
-        ),
-        RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
-        RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.3),
-        RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.01),
         EnsureTyped(keys=["image", "label"], dtype=torch.float32),
-    ])
+    ]
+
+    if args.strong_aug:
+        train_list.extend(
+            [
+                RandAffined(
+                    keys=["image", "label"],
+                    prob=0.2,
+                    rotate_range=(0.1, 0.1, 0.05),
+                    scale_range=(0.1, 0.1, 0.05),
+                    mode=("bilinear", "nearest"),
+                    padding_mode="border",
+                ),
+                RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.3),
+                RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.3),
+                RandGaussianNoised(keys=["image"], prob=0.15, mean=0.0, std=0.01),
+            ]
+        )
+    else:
+        train_list.extend(
+            [
+                RandAffined(
+                    keys=["image", "label"],
+                    prob=0.1,
+                    rotate_range=(0.05, 0.05, 0.02),
+                    scale_range=(0.05, 0.05, 0.02),
+                    mode=("bilinear", "nearest"),
+                    padding_mode="border",
+                ),
+                RandShiftIntensityd(keys=["image"], offsets=0.05, prob=0.1),
+                RandScaleIntensityd(keys=["image"], factors=0.05, prob=0.1),
+                RandGaussianNoised(keys=["image"], prob=0.05, mean=0.0, std=0.005),
+            ]
+        )
+
+    train_transforms = Compose(train_list)
 
     val_transforms = Compose([
         LoadImaged(keys=["image", "label"]),
         EnsureChannelFirstd(keys=["image", "label"]),
         Orientationd(keys=["image", "label"], axcodes=args.axcodes),
         Spacingd(keys=["image", "label"], pixdim=pixdim, mode=("bilinear", "nearest")),
+        ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=roi_size),
         ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
         Lambdad(keys=["label"], func=binarize_label),
         EnsureTyped(keys=["image", "label"], dtype=torch.float32),
@@ -305,7 +354,7 @@ def train_one_epoch(model, loader, optimizer, loss_func, device, args, fold_idx:
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images)
-        loss = loss_func(logits, labels)
+        loss = dice_bce_loss_from_logits(logits, labels)
         loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -320,7 +369,7 @@ def train_one_epoch(model, loader, optimizer, loss_func, device, args, fold_idx:
 
 
 @torch.no_grad()
-def validate(model, loader, loss_func, dice_metric, post_pred, post_label, device, args):
+def validate(model, loader, dice_metric, post_pred, post_label, device, args):
     model.eval()
     dice_metric.reset()
     val_loss = 0.0
@@ -338,7 +387,7 @@ def validate(model, loader, loss_func, dice_metric, post_pred, post_label, devic
             predictor=model,
             overlap=args.infer_overlap,
         )
-        val_loss += loss_func(logits, labels).item()
+        val_loss += dice_bce_loss_from_logits(logits, labels).item()
         preds_list = [post_pred(x) for x in decollate_batch(logits)]
         labels_list = [post_label(x) for x in decollate_batch(labels)]
         dice_metric(y_pred=preds_list, y=labels_list)
@@ -398,7 +447,6 @@ def train_one_fold(fold_idx: int, train_files, val_files, args, device):
         features=(args.f1, args.f2, args.f3, args.f4, args.f5),
     ).to(device)
 
-    loss_func = DiceCELoss(sigmoid=True, squared_pred=True, reduction="mean", lambda_dice=1.0, lambda_ce=1.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epochs, eta_min=args.eta_min)
 
@@ -434,9 +482,9 @@ def train_one_fold(fold_idx: int, train_files, val_files, args, device):
 
         for epoch in range(start_epoch, args.max_epochs + 1):
             print(f"[Fold {fold_idx}] Epoch {epoch}/{args.max_epochs} start...", flush=True)
-            train_loss = train_one_epoch(model, train_loader, optimizer, loss_func, device, args, fold_idx, epoch, args.max_epochs)
+            train_loss = train_one_epoch(model, train_loader, optimizer, None, device, args, fold_idx, epoch, args.max_epochs)
             print(f"[Fold {fold_idx}] Epoch {epoch}/{args.max_epochs} validation...", flush=True)
-            val_loss, val_dice = validate(model, val_loader, loss_func, dice_metric, post_pred, post_label, device, args)
+            val_loss, val_dice = validate(model, val_loader, dice_metric, post_pred, post_label, device, args)
 
             lr_now = optimizer.param_groups[0]["lr"]
             scheduler.step()
@@ -488,6 +536,8 @@ def train_one_fold(fold_idx: int, train_files, val_files, args, device):
             if epochs_no_improve >= args.early_stop_patience:
                 print(f"Early stopping on fold {fold_idx} at epoch {epoch}")
                 break
+
+    save_loss_plot(log_path, os.path.join(fold_dir, "loss_curve.png"))
 
     return {
         "fold": fold_idx,
@@ -545,3 +595,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

@@ -8,22 +8,22 @@ from typing import Dict, List
 
 from sklearn.model_selection import KFold
 
-DATA_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/EsoCTV_All"
-SAVE_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/Networks/VNet/EsoCTV_All"
+DATA_ROOT = r"/home/wusi/Project_crop/Data/Rectal_146/RectalCTV_All"
+SAVE_ROOT = r"/home/wusi/Project_crop/Data/Rectal_146/Networks/VNet/RectalCTV_All"
 RUNS_ROOT = os.path.join(SAVE_ROOT, "TrainResults")
 PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 
 CUDA_VISIBLE_DEVICES = "0"
 NUM_FOLDS = 5
-MAX_EPOCHS = 200
-EARLY_STOP_PATIENCE = 40
+MAX_EPOCHS = 100
+EARLY_STOP_PATIENCE = 15
 TRAIN_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 LR = 1e-4
 ETA_MIN = 1e-6
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 12.0
-SEED = 2026
+SEED = 42
 NUM_WORKERS = 0
 ROI_X, ROI_Y, ROI_Z = 96, 96, 64
 NUM_SAMPLES = 4

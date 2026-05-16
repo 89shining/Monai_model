@@ -1,4 +1,4 @@
-﻿import csv
+import csv
 import glob
 import os
 import subprocess
@@ -19,15 +19,15 @@ PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 CUDA_VISIBLE_DEVICES = "0"
 
 NUM_FOLDS = 5
-MAX_EPOCHS = 200
-EARLY_STOP_PATIENCE = 40
+MAX_EPOCHS = 100
+EARLY_STOP_PATIENCE = 15
 TRAIN_BATCH_SIZE = 1
 TEST_BATCH_SIZE = 1
 LR = 1e-4
 ETA_MIN = 1e-6
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 12.0
-SEED = 2026
+SEED = 42
 NUM_WORKERS = 0
 ROI_X, ROI_Y, ROI_Z = 96, 96, 64
 NUM_SAMPLES = 4
@@ -192,7 +192,6 @@ def main():
             "--data_root", DATA_ROOT,
             "--runs_root", RUNS_ROOT,
             "--num_folds", str(NUM_FOLDS),
-        "--fold", str(best_fold),
             "--seed", str(SEED),
             "--max_epochs", str(MAX_EPOCHS),
             "--early_stop_patience", str(EARLY_STOP_PATIENCE),
@@ -250,6 +249,7 @@ def main():
         "--infer_overlap", str(INFER_OVERLAP),
         "--threshold", str(THRESHOLD),
         "--num_folds", str(NUM_FOLDS),
+        "--fold", str(best_fold),
         "--a_min", str(A_MIN),
         "--a_max", str(A_MAX),
         "--pixdim_x", str(PIXDIM_X),
