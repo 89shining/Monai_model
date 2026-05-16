@@ -34,8 +34,8 @@ class Config:
     weight_decay: float = 1e-5
     grad_clip: float = 1.0
 
-    dice_weight: float = 0.5
-    bce_weight: float = 0.5
+    pos_weight: float = 50.0
+    eval_threshold: float = 0.5
 
     a_min: float = -160.0
     a_max: float = 240.0
@@ -48,6 +48,7 @@ class Config:
     pretrained: bool = False
     model_path: str = "model_data/xception_pytorch_imagenet.pth"
     resume: bool = True
+    debug: bool = True
 
 
 def set_seed(seed: int):
@@ -164,33 +165,39 @@ class SliceTrainDataset(Dataset):
         return image, label
 
 
-class DiceBCELoss(nn.Module):
-    def __init__(self, dice_weight: float = 0.5, bce_weight: float = 0.5):
+class SimpleBCELoss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.dice_weight = dice_weight
-        self.bce_weight = bce_weight
-        self.bce = nn.BCELoss(reduction="mean")
 
-    def forward(self, probs: torch.Tensor, target: torch.Tensor):
-        probs_f = probs.view(probs.shape[0], -1)
-        target_f = target.view(target.shape[0], -1)
-        inter = (probs_f * target_f).sum(dim=1)
-        den = probs_f.sum(dim=1) + target_f.sum(dim=1)
-        dice_loss = (1.0 - ((2.0 * inter + 1e-6) / (den + 1e-6))).mean()
-        bce_loss = self.bce(probs, target)
-        return self.dice_weight * dice_loss + self.bce_weight * bce_loss
+    def forward(self, logits: torch.Tensor, target: torch.Tensor, pos_weight: torch.Tensor):
+        return torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, target, pos_weight=pos_weight, reduction="mean"
+        )
 
 
-def patient_3d_dice(model: nn.Module, case_ids: List[str], image_map: Dict[str, str], label_map: Dict[str, str], cfg: Config, device: torch.device) -> float:
+def patient_3d_dice(
+    model: nn.Module,
+    case_ids: List[str],
+    image_map: Dict[str, str],
+    label_map: Dict[str, str],
+    cfg: Config,
+    device: torch.device,
+) -> Tuple[float, float, float, float, float, float]:
     model.eval()
-    dices = []
+    hard_dices = []
+    best_hard_dices = []
+    best_thresholds = []
+    soft_dices = []
+    pred_fg_ratios = []
+    gt_fg_ratios = []
+    thr_grid = [0.10, 0.20, 0.30, 0.40, 0.50]
     with torch.no_grad():
         for cid in case_ids:
             if cid not in image_map or cid not in label_map:
                 continue
             vol = sitk.GetArrayFromImage(sitk.ReadImage(image_map[cid])).astype(np.float32)
             lab = (sitk.GetArrayFromImage(sitk.ReadImage(label_map[cid])) > 0).astype(np.float32)
-            preds = []
+            probs_vol = []
             for z in range(vol.shape[0]):
                 img = window_norm(vol[z], cfg.a_min, cfg.a_max)
                 img = resize2d(img, cfg.input_h, cfg.input_w, "linear")
@@ -198,15 +205,45 @@ def patient_3d_dice(model: nn.Module, case_ids: List[str], image_map: Dict[str, 
                 x = x.repeat(1, 3, 1, 1)
                 logits = model(x)
                 probs = torch.sigmoid(logits)
-                pred = (probs > 0.5).float().cpu().numpy()[0, 0]
-                pred = resize2d(pred, lab.shape[1], lab.shape[2], "nearest")
-                preds.append(pred)
-            pred_vol = np.stack(preds, axis=0)
+                probs_vol.append(probs.cpu().numpy()[0, 0])
+            probs_vol = np.stack(probs_vol, axis=0)
+            probs_vol = np.stack([resize2d(s, lab.shape[1], lab.shape[2], "linear") for s in probs_vol], axis=0)
+
+            pred_vol = (probs_vol > cfg.eval_threshold).astype(np.float32)
             inter = float((pred_vol * lab).sum())
             den = float(pred_vol.sum() + lab.sum())
-            dice = (2.0 * inter + 1e-6) / (den + 1e-6)
-            dices.append(dice)
-    return float(np.mean(dices)) if dices else 0.0
+            hard_dice = (2.0 * inter + 1e-6) / (den + 1e-6)
+
+            case_best_dice = -1.0
+            case_best_thr = cfg.eval_threshold
+            for thr in thr_grid:
+                pred_thr = (probs_vol > thr).astype(np.float32)
+                inter_thr = float((pred_thr * lab).sum())
+                den_thr = float(pred_thr.sum() + lab.sum())
+                dice_thr = (2.0 * inter_thr + 1e-6) / (den_thr + 1e-6)
+                if dice_thr > case_best_dice:
+                    case_best_dice = dice_thr
+                    case_best_thr = thr
+
+            soft_inter = float((probs_vol * lab).sum())
+            soft_den = float(probs_vol.sum() + lab.sum())
+            soft_dice = (2.0 * soft_inter + 1e-6) / (soft_den + 1e-6)
+            hard_dices.append(hard_dice)
+            best_hard_dices.append(case_best_dice)
+            best_thresholds.append(case_best_thr)
+            soft_dices.append(soft_dice)
+            pred_fg_ratios.append(float(pred_vol.mean()))
+            gt_fg_ratios.append(float(lab.mean()))
+    if not hard_dices:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, cfg.eval_threshold
+    return (
+        float(np.mean(hard_dices)),
+        float(np.mean(best_hard_dices)),
+        float(np.mean(soft_dices)),
+        float(np.mean(pred_fg_ratios)),
+        float(np.mean(gt_fg_ratios)),
+        float(np.mean(best_thresholds)),
+    )
 
 
 def build_model(cfg: Config, device: torch.device) -> nn.Module:
@@ -225,6 +262,8 @@ def main():
     cfg.fold = int(os.environ.get("DEEPLAB_FOLD", "0"))
     cfg.data_root = os.environ.get("DEEPLAB_DATA_ROOT", cfg.data_root)
     cfg.save_root = os.environ.get("DEEPLAB_SAVE_DIR", os.path.join(cfg.save_root, f"fold_{cfg.fold}"))
+    cfg.resume = os.environ.get("DEEPLAB_RESUME", "1").strip().lower() in {"1", "true", "yes", "y"}
+    cfg.debug = os.environ.get("DEEPLAB_DEBUG", "1").strip().lower() in {"1", "true", "yes", "y"}
     os.makedirs(cfg.save_root, exist_ok=True)
 
     set_seed(cfg.seed)
@@ -235,12 +274,19 @@ def main():
     case_ids = sorted(set(image_map.keys()).intersection(set(label_map.keys())))
     splits = make_patient_splits(case_ids, cfg.num_folds, cfg.seed)
     train_ids, val_ids = splits[cfg.fold]
+    print(
+        f"[Split] fold={cfg.fold} | total_cases={len(case_ids)} | train_cases={len(train_ids)} | val_cases={len(val_ids)}",
+        flush=True,
+    )
 
     train_ds = SliceTrainDataset(train_ids, image_map, label_map, cfg)
+    print(f"[Data] train_slices={len(train_ds)}", flush=True)
+    if len(val_ids) == 0:
+        raise RuntimeError(f"Validation set is empty for fold {cfg.fold}. Check num_folds or data_root.")
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=(device.type=="cuda"), drop_last=True)
 
     model = build_model(cfg, device)
-    loss_fn = DiceBCELoss(cfg.dice_weight, cfg.bce_weight)
+    loss_fn = SimpleBCELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.eta_min)
 
@@ -282,21 +328,23 @@ def main():
             y = y.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
-            probs = torch.sigmoid(logits)
-            loss = loss_fn(probs, y)
+            pos_weight_t = torch.tensor([cfg.pos_weight], device=device, dtype=logits.dtype)
+            loss = loss_fn(logits, y, pos_weight_t)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
             total_loss += loss.item()
 
         train_loss = total_loss / max(steps, 1)
-        val_dice = patient_3d_dice(model, val_ids, image_map, label_map, cfg, device)
+        val_dice, val_dice_best_thr, val_soft_dice, pred_fg_ratio, gt_fg_ratio, best_thr_mean = patient_3d_dice(
+            model, val_ids, image_map, label_map, cfg, device
+        )
         lr_now = optimizer.param_groups[0]["lr"]
         scheduler.step()
 
-        is_best = val_dice > best_dice
+        is_best = val_dice_best_thr > best_dice
         if is_best:
-            best_dice = val_dice
+            best_dice = val_dice_best_thr
             best_epoch = epoch
             patience_count = 0
             ckpt = {
@@ -326,11 +374,34 @@ def main():
             latest_ckpt_path,
         )
 
-        log_rows.append({"epoch": epoch, "train_loss": f"{train_loss:.6f}", "val_dice_fg": f"{val_dice:.6f}", "lr": f"{lr_now:.8f}", "is_best": int(is_best)})
-        print(f"Fold {cfg.fold} | Epoch {epoch}/{cfg.epochs} | TrainLoss {train_loss:.4f} | ValDice3D {val_dice:.4f} | LR {lr_now:.2e}", flush=True)
+        log_rows.append(
+            {
+                "epoch": epoch,
+                "train_loss": f"{train_loss:.6f}",
+                "val_dice_fg": f"{val_dice:.6f}",
+                "val_dice_best_thr": f"{val_dice_best_thr:.6f}",
+                "best_thr_mean": f"{best_thr_mean:.2f}",
+                "lr": f"{lr_now:.8f}",
+                "is_best": int(is_best),
+            }
+        )
+        print(
+            f"Fold {cfg.fold} | Epoch {epoch}/{cfg.epochs} | TrainLoss {train_loss:.4f} | "
+            f"ValDice3D@{cfg.eval_threshold:.2f} {val_dice:.4f} | ValDice3D@BestThr {val_dice_best_thr:.4f} | LR {lr_now:.2e}",
+            flush=True,
+        )
+        if cfg.debug:
+            print(
+                f"[Debug] Epoch {epoch} | SoftDice3D {val_soft_dice:.4f} | PredFG {pred_fg_ratio:.5f} | "
+                f"GTFG {gt_fg_ratio:.5f} | PosW {cfg.pos_weight:.2f} | BestThrMean {best_thr_mean:.2f}",
+                flush=True,
+            )
 
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_dice_fg", "lr", "is_best"])
+            w = csv.DictWriter(
+                f,
+                fieldnames=["epoch", "train_loss", "val_dice_fg", "val_dice_best_thr", "best_thr_mean", "lr", "is_best"],
+            )
             w.writeheader()
             for r in log_rows:
                 w.writerow(r)

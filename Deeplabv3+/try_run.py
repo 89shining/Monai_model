@@ -17,6 +17,8 @@ def parse_args():
     p.add_argument('--data_root', type=str, default=DATA_ROOT)
     p.add_argument('--train_results', type=str, default=TRAIN_RESULTS)
     p.add_argument('--test_results', type=str, default=TEST_RESULTS)
+    p.add_argument('--resume', action='store_true', help='Resume from latest checkpoint if exists.')
+    p.add_argument('--no_debug', action='store_true', help='Disable training debug logs.')
     return p.parse_args()
 
 
@@ -37,6 +39,8 @@ def main():
     env['DEEPLAB_DATA_ROOT'] = args.data_root
     env['DEEPLAB_SAVE_DIR'] = fold_dir
     env['DEEPLAB_FOLD'] = str(args.fold)
+    env['DEEPLAB_RESUME'] = '1' if args.resume else '0'
+    env['DEEPLAB_DEBUG'] = '0' if args.no_debug else '1'
 
     print(f'[TryRun] Train fold={args.fold}', flush=True)
     subprocess.run([sys.executable, train_py], check=True, env=env)
