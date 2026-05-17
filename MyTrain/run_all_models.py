@@ -19,6 +19,11 @@ def append_text(path: Path, text: str) -> None:
         f.write(text)
 
 
+def log_both(path: Path, text: str) -> None:
+    print(text, end="", flush=True)
+    append_text(path, text)
+
+
 def load_state(state_path: Path) -> Dict:
     if not state_path.exists():
         return {"models": {}}
@@ -93,7 +98,7 @@ def main() -> int:
     state = load_state(state_path)
     state.setdefault("models", {})
 
-    append_text(master_log, f"\n[{now_str()}] Runner started | root={root}\n")
+    log_both(master_log, f"\n[{now_str()}] Runner started | root={root}\n")
 
     env = dict(os.environ)
 
@@ -105,7 +110,7 @@ def main() -> int:
 
         if not run_py.exists():
             msg = f"[{now_str()}] SKIP {name} | run.py not found: {run_py}\n"
-            append_text(master_log, msg)
+            log_both(master_log, msg)
             state["models"][name] = {
                 "status": "missing",
                 "last_run": now_str(),
@@ -116,10 +121,11 @@ def main() -> int:
             continue
 
         if (not args.rerun_completed) and state["models"].get(name, {}).get("status") == "completed":
-            append_text(master_log, f"[{now_str()}] SKIP {name} | already completed in state\n")
+            log_both(master_log, f"[{now_str()}] SKIP {name} | already completed in state\n")
             continue
 
         try:
+            log_both(master_log, f"[{now_str()}] RUN {name} ...\n")
             rc = run_model(name, run_py, workdir, model_log, env)
             status = "completed" if rc == 0 else "failed"
             state["models"][name] = {
@@ -130,7 +136,7 @@ def main() -> int:
                 "log_file": str(model_log),
             }
             save_state(state_path, state)
-            append_text(master_log, f"[{now_str()}] {name} finished | status={status} | rc={rc} | log={model_log}\n")
+            log_both(master_log, f"[{now_str()}] {name} finished | status={status} | rc={rc} | log={model_log}\n")
         except KeyboardInterrupt:
             state["models"].setdefault(name, {})
             state["models"][name].update({
@@ -140,7 +146,7 @@ def main() -> int:
                 "log_file": str(model_log),
             })
             save_state(state_path, state)
-            append_text(master_log, f"[{now_str()}] INTERRUPTED at {name}. Re-run script to resume.\n")
+            log_both(master_log, f"[{now_str()}] INTERRUPTED at {name}. Re-run script to resume.\n")
             raise
         except Exception as e:
             state["models"][name] = {
@@ -151,11 +157,11 @@ def main() -> int:
                 "log_file": str(model_log),
             }
             save_state(state_path, state)
-            append_text(master_log, f"[{now_str()}] Runner exception on {name}: {repr(e)}\n")
+            log_both(master_log, f"[{now_str()}] Runner exception on {name}: {repr(e)}\n")
             # continue to next model as requested
             continue
 
-    append_text(master_log, f"[{now_str()}] Runner finished\n")
+    log_both(master_log, f"[{now_str()}] Runner finished\n")
 
     failed = [k for k, v in state["models"].items() if v.get("status") not in ("completed",)]
     return 0 if not failed else 1

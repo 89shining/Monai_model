@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import SimpleITK as sitk
 import torch
@@ -190,6 +191,30 @@ def dice_bce_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: f
     return 0.5 * dice_loss + 0.5 * bce_norm
 
 
+def save_loss_plot(csv_path: str, out_png: str) -> None:
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return
+        epochs = [int(r["epoch"]) for r in rows]
+        train_loss = [float(r["train_loss"]) for r in rows]
+        val_loss = [float(r["val_loss"]) for r in rows]
+        plt.figure(figsize=(7, 4))
+        plt.plot(epochs, train_loss, label="train_loss")
+        plt.plot(epochs, val_loss, label="val_loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Fold Loss Curve")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"[Warn] save_loss_plot failed: {e}", flush=True)
+
+
 def build_model(backbone: str) -> nn.Module:
     model_dir = os.path.join(os.path.dirname(__file__), "model_data")
     pretrain_file = {
@@ -302,6 +327,7 @@ def run_fold(args, fold: int, train_cases: List[CaseData], val_cases: List[CaseD
         if bad_epochs >= args.early_stop:
             print(f"[EarlyStop] fold={fold}, epoch={epoch}")
             break
+    save_loss_plot(metrics_csv, os.path.join(fold_dir, "loss_curve.png"))
 
     return best_epoch, best_dice
 
