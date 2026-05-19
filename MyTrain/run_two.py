@@ -1,9 +1,11 @@
 import argparse
+import concurrent.futures
 import json
 import os
 import platform
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -43,6 +45,7 @@ def run_model(name: str, run_py: Path, workdir: Path, log_file: Path, env: Dict[
         f"[{now_str()}] START {name}\n"
         f"workdir={workdir}\n"
         f"cmd={sys.executable} {run_py}\n"
+        f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '')}\n"
         + "=" * 100 + "\n"
     )
     append_text(log_file, header)
@@ -66,11 +69,13 @@ def run_model(name: str, run_py: Path, workdir: Path, log_file: Path, env: Dict[
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Sequential trainer for Deeplabv3+, DDUnet, AttentionUNet, VNet.")
+    parser = argparse.ArgumentParser(description="Two-GPU grouped runner: group-parallel, in-group sequential.")
     parser.add_argument("--root", type=str, default=None, help="Project root directory")
     parser.add_argument("--state", type=str, default="runner_state.json", help="State file under MyTrain")
     parser.add_argument("--log-dir", type=str, default="logs", help="Log directory under MyTrain")
     parser.add_argument("--rerun-completed", action="store_true", help="Run models even if state marks them completed")
+    parser.add_argument("--gpu-a", type=str, default="0", help="GPU for group A: VNet -> Deeplabv3+")
+    parser.add_argument("--gpu-b", type=str, default="1", help="GPU for group B: AttentionUNet -> DDUnet")
     args = parser.parse_args()
 
     if args.root:
@@ -81,8 +86,8 @@ def main() -> int:
             )
         root = Path(args.root).expanduser().resolve()
     else:
-        # Default to the parent of this script's directory: <root>/MyTrain/run_all_models.py
         root = Path(__file__).resolve().parent.parent
+
     mytrain = root / "MyTrain"
     state_path = mytrain / args.state
     log_dir = mytrain / args.log_dir
@@ -94,72 +99,80 @@ def main() -> int:
         {"name": "AttentionUNet", "run_py": root / "AttentionUNet" / "run.py", "workdir": root / "AttentionUNet"},
         {"name": "VNet", "run_py": root / "VNet" / "run.py", "workdir": root / "VNet"},
     ]
+    models_by_name = {m["name"]: m for m in models}
+
+    groups = {
+        "A": {"gpu": args.gpu_a, "models": ["VNet", "Deeplabv3+"]},
+        "B": {"gpu": args.gpu_b, "models": ["AttentionUNet", "DDUnet"]},
+    }
 
     state = load_state(state_path)
     state.setdefault("models", {})
 
     log_both(master_log, f"\n[{now_str()}] Runner started | root={root}\n")
 
-    env = dict(os.environ)
+    base_env = dict(os.environ)
+    io_lock = threading.Lock()
 
-    for m in models:
-        name = m["name"]
-        run_py = m["run_py"]
-        workdir = m["workdir"]
-        model_log = log_dir / f"{name.replace('+', 'plus').lower()}.log"
+    def run_group(group_name: str, gpu_id: str, ordered_models: List[str]) -> None:
+        for model_name in ordered_models:
+            m = models_by_name[model_name]
+            name = m["name"]
+            run_py = m["run_py"]
+            workdir = m["workdir"]
+            model_log = log_dir / f"{name.replace('+', 'plus').lower()}.log"
 
-        if not run_py.exists():
-            msg = f"[{now_str()}] SKIP {name} | run.py not found: {run_py}\n"
-            log_both(master_log, msg)
-            state["models"][name] = {
-                "status": "missing",
-                "last_run": now_str(),
-                "return_code": None,
-                "run_py": str(run_py),
-            }
-            save_state(state_path, state)
-            continue
+            if not run_py.exists():
+                with io_lock:
+                    log_both(master_log, f"[{now_str()}] SKIP {name} | run.py not found: {run_py}\n")
+                    state["models"][name] = {
+                        "status": "missing",
+                        "last_run": now_str(),
+                        "return_code": None,
+                        "run_py": str(run_py),
+                    }
+                    save_state(state_path, state)
+                continue
 
-        if (not args.rerun_completed) and state["models"].get(name, {}).get("status") == "completed":
-            log_both(master_log, f"[{now_str()}] SKIP {name} | already completed in state\n")
-            continue
+            if (not args.rerun_completed) and state["models"].get(name, {}).get("status") == "completed":
+                with io_lock:
+                    log_both(master_log, f"[{now_str()}] SKIP {name} | already completed in state\n")
+                continue
 
-        try:
-            log_both(master_log, f"[{now_str()}] RUN {name} ...\n")
+            env = dict(base_env)
+            env["CUDA_VISIBLE_DEVICES"] = gpu_id
+
+            with io_lock:
+                log_both(master_log, f"[{now_str()}] RUN {name} ... | group={group_name} | gpu={gpu_id}\n")
+
             rc = run_model(name, run_py, workdir, model_log, env)
             status = "completed" if rc == 0 else "failed"
-            state["models"][name] = {
-                "status": status,
-                "last_run": now_str(),
-                "return_code": rc,
-                "run_py": str(run_py),
-                "log_file": str(model_log),
-            }
-            save_state(state_path, state)
-            log_both(master_log, f"[{now_str()}] {name} finished | status={status} | rc={rc} | log={model_log}\n")
-        except KeyboardInterrupt:
-            state["models"].setdefault(name, {})
-            state["models"][name].update({
-                "status": "interrupted",
-                "last_run": now_str(),
-                "run_py": str(run_py),
-                "log_file": str(model_log),
-            })
-            save_state(state_path, state)
-            log_both(master_log, f"[{now_str()}] INTERRUPTED at {name}. Re-run script to resume.\n")
-            raise
-        except Exception as e:
-            state["models"][name] = {
-                "status": "runner_error",
-                "last_run": now_str(),
-                "error": repr(e),
-                "run_py": str(run_py),
-                "log_file": str(model_log),
-            }
-            save_state(state_path, state)
-            log_both(master_log, f"[{now_str()}] Runner exception on {name}: {repr(e)}\n")
-            # continue to next model as requested
-            continue
+
+            with io_lock:
+                state["models"][name] = {
+                    "status": status,
+                    "last_run": now_str(),
+                    "return_code": rc,
+                    "run_py": str(run_py),
+                    "log_file": str(model_log),
+                }
+                save_state(state_path, state)
+                log_both(master_log, f"[{now_str()}] {name} finished | status={status} | rc={rc} | log={model_log}\n")
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fa = executor.submit(run_group, "A", groups["A"]["gpu"], groups["A"]["models"])
+            fb = executor.submit(run_group, "B", groups["B"]["gpu"], groups["B"]["models"])
+            fa.result()
+            fb.result()
+    except KeyboardInterrupt:
+        with io_lock:
+            log_both(master_log, f"[{now_str()}] INTERRUPTED. Re-run script to resume.\n")
+        raise
+    except Exception as e:
+        with io_lock:
+            log_both(master_log, f"[{now_str()}] Runner exception: {repr(e)}\n")
+        raise
 
     log_both(master_log, f"[{now_str()}] Runner finished\n")
 
