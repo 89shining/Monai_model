@@ -16,7 +16,7 @@ SAVE_ROOT = r"/home/wusi/Project_crop/Data/Eso_83/Networks/AttentionUNet/EsoCTV_
 RUNS_ROOT = os.path.join(SAVE_ROOT, "TrainResults")
 PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 
-CUDA_VISIBLE_DEVICES = "0"
+CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
 NUM_FOLDS = 5
 MAX_EPOCHS = 100
@@ -60,6 +60,16 @@ def read_best_from_fold_epoch_csv(fold_dir: str):
 
     best_row = max(rows, key=lambda r: float(r["val_dice_fg"]))
     return int(best_row["epoch"]), float(best_row["val_dice_fg"])
+
+
+def is_fold_completed(fold_dir: str, fold: int) -> bool:
+    ckpt = os.path.join(fold_dir, f"best_model_fold{fold}.pth")
+    epoch_csv = os.path.join(fold_dir, "epoch_metrics.csv")
+    if not (os.path.exists(ckpt) and os.path.exists(epoch_csv)):
+        return False
+    with open(epoch_csv, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    return len(rows) > 0
 
 
 def strip_nii_ext(filename: str) -> str:
@@ -118,12 +128,10 @@ def write_cv_results(runs_root: str, num_folds: int, seed: int, data_root: str):
     for fold in range(num_folds):
         fold_dir = os.path.join(runs_root, f"fold_{fold}")
         ckpt = os.path.join(fold_dir, f"best_model_fold{fold}.pth")
-        done_marker = os.path.join(fold_dir, "fold_done.flag")
-
-        if not os.path.exists(done_marker):
-            raise FileNotFoundError(f"Missing done marker: {done_marker}")
-        if not os.path.exists(ckpt):
-            raise FileNotFoundError(f"Missing checkpoint: {ckpt}")
+        if not is_fold_completed(fold_dir, fold):
+            raise FileNotFoundError(
+                f"Fold {fold} is incomplete. Expected checkpoint + non-empty epoch_metrics.csv under: {fold_dir}"
+            )
 
         best_epoch, best_dice = read_best_from_fold_epoch_csv(fold_dir)
         ntr, nval = split_sizes[fold]
@@ -180,9 +188,12 @@ def main():
     for fold in range(NUM_FOLDS):
         fold_dir = os.path.join(RUNS_ROOT, f"fold_{fold}")
         done_marker = os.path.join(fold_dir, "fold_done.flag")
-        ckpt = os.path.join(fold_dir, f"best_model_fold{fold}.pth")
 
-        if AUTO_RESUME and os.path.exists(done_marker) and os.path.exists(ckpt):
+        if AUTO_RESUME and is_fold_completed(fold_dir, fold):
+            if not os.path.exists(done_marker):
+                os.makedirs(fold_dir, exist_ok=True)
+                with open(done_marker, "w", encoding="utf-8") as f:
+                    f.write(f"done_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             print(f"[Resume] Skip completed fold {fold}")
             continue
 

@@ -2,17 +2,19 @@ import argparse
 import glob
 import os
 
-import SimpleITK as sitk
 import torch
-from monai.data import DataLoader, Dataset
+from monai.data import DataLoader, Dataset, decollate_batch
 from monai.inferers import sliding_window_inference
 from monai.transforms import (
+    AsDiscreted,
     Compose,
     EnsureChannelFirstd,
     EnsureTyped,
+    Invertd,
     Lambdad,
     LoadImaged,
     Orientationd,
+    SaveImaged,
     ScaleIntensityRanged,
     Spacingd,
 )
@@ -144,7 +146,28 @@ def main():
         ),
         ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
         Lambdad(keys="label", func=_binarize_label),
-        EnsureTyped(keys=["image", "label"]),
+        EnsureTyped(keys=["image", "label"], track_meta=True),
+    ])
+    post_transforms = Compose([
+        AsDiscreted(keys="pred", threshold=args.threshold),
+        Invertd(
+            keys="pred",
+            transform=test_transforms,
+            orig_keys="image",
+            nearest_interp=True,
+            to_tensor=False,
+        ),
+        SaveImaged(
+            keys="pred",
+            meta_keys="pred_meta_dict",
+            output_dir=args.save_dir,
+            output_postfix="",
+            output_ext=".nii.gz",
+            separate_folder=False,
+            output_dtype="uint8",
+            resample=False,
+            print_log=False,
+        ),
     ])
 
     data_dicts = build_test_data(args.data_root)
@@ -180,23 +203,15 @@ def main():
                 probs = torch.sigmoid(logits)
                 prob_sum = probs if prob_sum is None else (prob_sum + probs)
 
-            output = prob_sum / float(len(models))
-            output = (output > args.threshold).float()
-
-            bs = output.shape[0]
-            for i in range(bs):
-                pred = output[i, 0].cpu().numpy().astype("uint8")
-                image_path = batch["image_meta_dict"]["filename_or_obj"][i]
-                label_path = batch["label_meta_dict"]["filename_or_obj"][i]
-                save_name = os.path.basename(label_path)
-
-                itk_img = sitk.ReadImage(image_path)
-                pred_itk = sitk.GetImageFromArray(pred)
-                pred_itk.CopyInformation(itk_img)
-
-                out_path = os.path.join(args.save_dir, save_name)
-                sitk.WriteImage(pred_itk, out_path)
-                print(f"Saved: {out_path}")
+            batch["pred"] = prob_sum / float(len(models))
+            for item in decollate_batch(batch):
+                out = post_transforms(item)
+                meta = out.get("pred_meta_dict") if isinstance(out, dict) else None
+                saved_to = None if meta is None else meta.get("saved_to")
+                if saved_to:
+                    print(f"Saved: {saved_to}")
+                else:
+                    print("Saved one prediction file.")
 
 
 if __name__ == "__main__":

@@ -8,12 +8,13 @@ from typing import Dict, List
 
 from sklearn.model_selection import KFold
 
-DATA_ROOT = r"/home/wusi/Project_crop/Data/Rectal_146/RectalCTV_All"
-SAVE_ROOT = r"/home/wusi/Project_crop/Data/Rectal_146/Networks/VNet/RectalCTV_All"
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.environ.get("MONAI_DATA_ROOT", r"/home/wusi/Project_crop/Data/Rectal_146/RectalCTV_All")
+SAVE_ROOT = os.environ.get("MONAI_SAVE_ROOT", r"/home/wusi/Project_crop/Data/Rectal_146/Networks/VNet/RectalCTV_All")
 RUNS_ROOT = os.path.join(SAVE_ROOT, "TrainResults")
 PRED_SAVE_DIR = os.path.join(SAVE_ROOT, "TestResults")
 
-CUDA_VISIBLE_DEVICES = "0"
+CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 NUM_FOLDS = 5
 MAX_EPOCHS = 100
 EARLY_STOP_PATIENCE = 15
@@ -69,6 +70,11 @@ def read_best_from_fold_epoch_csv(fold_dir: str):
     return int(best['epoch']), float(best['val_dice_fg'])
 
 
+def is_fold_completed(fold_dir: str, fold: int) -> bool:
+    done_marker = os.path.join(fold_dir, 'fold_done.flag')
+    return os.path.exists(done_marker)
+
+
 def write_cv_results(runs_root: str, num_folds: int, seed: int, data_root: str):
     case_ids = collect_case_ids(data_root)
     kf = KFold(n_splits=num_folds, shuffle=True, random_state=seed)
@@ -98,15 +104,24 @@ def pick_best_fold(cv_path: str) -> int:
 def main():
     os.makedirs(RUNS_ROOT, exist_ok=True); os.makedirs(PRED_SAVE_DIR, exist_ok=True)
     env = dict(os.environ); env['CUDA_VISIBLE_DEVICES'] = CUDA_VISIBLE_DEVICES
-    train_py = os.path.join(os.path.dirname(__file__), 'train.py')
-    test_py = os.path.join(os.path.dirname(__file__), 'test.py')
+    train_py = os.path.join(THIS_DIR, 'train.py')
+    test_py = os.path.join(THIS_DIR, 'test.py')
 
     for fold in range(NUM_FOLDS):
         fold_dir = os.path.join(RUNS_ROOT, f'fold_{fold}')
         done_marker = os.path.join(fold_dir, 'fold_done.flag')
-        ckpt = os.path.join(fold_dir, f'best_model_fold{fold}.pth')
-        if AUTO_RESUME and os.path.exists(done_marker) and os.path.exists(ckpt):
+        if AUTO_RESUME and is_fold_completed(fold_dir, fold):
+            print(f"[Skip] fold_{fold} already has valid artifacts in: {fold_dir}", flush=True)
+            if not os.path.exists(done_marker):
+                os.makedirs(fold_dir, exist_ok=True)
+                with open(done_marker, 'w', encoding='utf-8') as f:
+                    f.write(f"done_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             continue
+        last_state = os.path.join(fold_dir, f'last_state_fold{fold}.pt')
+        if AUTO_RESUME and os.path.exists(last_state):
+            print(f"[Resume] fold_{fold} from: {last_state}", flush=True)
+        else:
+            print(f"[Train] fold_{fold} from scratch", flush=True)
         cmd = [sys.executable, train_py, '--data_root', DATA_ROOT, '--runs_root', RUNS_ROOT, '--num_folds', str(NUM_FOLDS), '--seed', str(SEED),
                '--max_epochs', str(MAX_EPOCHS), '--early_stop_patience', str(EARLY_STOP_PATIENCE), '--batch_size', str(TRAIN_BATCH_SIZE), '--num_workers', str(NUM_WORKERS),
                '--lr', str(LR), '--eta_min', str(ETA_MIN), '--weight_decay', str(WEIGHT_DECAY), '--grad_clip', str(GRAD_CLIP), '--roi_x', str(ROI_X), '--roi_y', str(ROI_Y), '--roi_z', str(ROI_Z),

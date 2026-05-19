@@ -3,11 +3,10 @@ import csv
 import glob
 import os
 
-import SimpleITK as sitk
 import torch
-from monai.data import DataLoader, Dataset
+from monai.data import DataLoader, Dataset, decollate_batch
 from monai.inferers import sliding_window_inference
-from monai.transforms import Compose, EnsureChannelFirstd, EnsureTyped, Lambdad, LoadImaged, Orientationd, ScaleIntensityRanged, Spacingd
+from monai.transforms import AsDiscreted, Compose, EnsureChannelFirstd, EnsureTyped, Invertd, Lambdad, LoadImaged, Orientationd, SaveImaged, ScaleIntensityRanged, Spacingd
 
 from train import VNet3DSeg
 
@@ -80,7 +79,28 @@ def main():
         Orientationd(keys=['image', 'label'], axcodes=args.axcodes),
         Spacingd(keys=['image', 'label'], pixdim=(args.pixdim_x, args.pixdim_y, args.pixdim_z), mode=('bilinear', 'nearest')),
         ScaleIntensityRanged(keys=['image'], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
-        Lambdad(keys='label', func=_bin), EnsureTyped(keys=['image', 'label']),
+        Lambdad(keys='label', func=_bin), EnsureTyped(keys=['image', 'label'], track_meta=True),
+    ])
+    post_transforms = Compose([
+        AsDiscreted(keys='pred', threshold=args.threshold),
+        Invertd(
+            keys='pred',
+            transform=tf,
+            orig_keys='image',
+            nearest_interp=True,
+            to_tensor=False,
+        ),
+        SaveImaged(
+            keys='pred',
+            meta_keys='pred_meta_dict',
+            output_dir=args.save_dir,
+            output_postfix='',
+            output_ext='.nii.gz',
+            separate_folder=False,
+            output_dtype='uint8',
+            resample=False,
+            print_log=False,
+        ),
     ])
 
     loader = DataLoader(Dataset(build_test_data(args.data_root), tf), batch_size=args.batch_size, shuffle=False,
@@ -90,16 +110,15 @@ def main():
         for batch in loader:
             image = batch['image'].to(device)
             probs = sliding_window_inference(image, (args.roi_x, args.roi_y, args.roi_z), args.sw_batch_size, model, overlap=args.infer_overlap)
-            output = (probs > args.threshold).float()
-            for i in range(output.shape[0]):
-                pred = output[i, 0].cpu().numpy().astype('uint8')
-                image_path = batch['image_meta_dict']['filename_or_obj'][i]
-                label_path = batch['label_meta_dict']['filename_or_obj'][i]
-                save_name = os.path.basename(label_path)
-                itk_img = sitk.ReadImage(image_path)
-                pred_itk = sitk.GetImageFromArray(pred)
-                pred_itk.CopyInformation(itk_img)
-                sitk.WriteImage(pred_itk, os.path.join(args.save_dir, save_name))
+            batch['pred'] = probs
+            for item in decollate_batch(batch):
+                out = post_transforms(item)
+                meta = out.get('pred_meta_dict') if isinstance(out, dict) else None
+                saved_to = None if meta is None else meta.get('saved_to')
+                if saved_to:
+                    print(f"Saved: {saved_to}")
+                else:
+                    print("Saved one prediction file.")
 
 
 if __name__ == '__main__':
