@@ -72,7 +72,7 @@ def main() -> int:
         if platform.system() != "Windows" and ":" in args.root:
             raise ValueError(
                 f"Invalid --root for non-Windows environment: {args.root}. "
-                "Please use an absolute Linux path like /home/wusi/Project_crop/Monai_model."
+                "Please use an absolute Linux path like /home/intern/ftp/wusi/Project_crop/Monai_model."
             )
         root = Path(args.root).expanduser().resolve()
     else:
