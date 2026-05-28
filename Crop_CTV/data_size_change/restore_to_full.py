@@ -32,6 +32,40 @@ def list_nii_files(folder: str) -> List[str]:
     return sorted(set(paths))
 
 
+def remove_suffix_from_pred_filenames(pred_dir: str, suffix: str) -> None:
+    if not suffix:
+        return
+
+    pred_paths = list_nii_files(pred_dir)
+    renamed = 0
+    skipped = 0
+    for src in pred_paths:
+        name = os.path.basename(src)
+        stem = strip_nii_ext(name)
+        ext = ".nii.gz" if name.endswith(".nii.gz") else ".nii"
+        if not stem.endswith(suffix):
+            skipped += 1
+            continue
+
+        new_stem = stem[: -len(suffix)]
+        if not new_stem:
+            skipped += 1
+            continue
+        dst = os.path.join(pred_dir, new_stem + ext)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            skipped += 1
+            continue
+        if os.path.exists(dst):
+            print(f"[Rename Skip] target exists: {os.path.basename(dst)}")
+            skipped += 1
+            continue
+
+        os.rename(src, dst)
+        renamed += 1
+        print(f"[Rename] {name} -> {os.path.basename(dst)}")
+    print(f"[Rename Done] Renamed={renamed}, Skipped={skipped}")
+
+
 def get_io_backend() -> Tuple[str, Any]:
     try:
         import SimpleITK as sitk  # type: ignore
@@ -164,22 +198,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Restore GT-slice-cropped predictions to full volume size")
     parser.add_argument(
         "--pred_dir",
-        default=r"C:\Users\dell\Desktop\Eso_83\nnUNet_pre_crop",
+        default=r"D:\SAM\Crop\Rectal_146\Deeplabv3+\Deeplabv3+_pre_crop",
         help="Prediction folder (*.nii / *.nii.gz)",
     )
     parser.add_argument(
         "--gt_dir",
-        default=r"C:\Users\dell\Desktop\Eso_83\labelsTs",
+        default=r"D:\SAM\Crop\Rectal_146\labelsTs",
         help="Full-size GT folder",
     )
     parser.add_argument(
         "--image_dir",
-        default=r"C:\Users\dell\Desktop\Eso_83\imagesTs",
+        default=r"D:\SAM\Crop\Rectal_146\imagesTs",
         help="Original image folder",
     )
     parser.add_argument(
         "--out_dir",
-        default=r"C:\Users\dell\Desktop\Eso_83\nnUNet_crop_restore",
+        default=r"D:\SAM\Crop\Rectal_146\Deeplabv3+\Deeplabv3+_all_preprocess",
         help="Output folder",
     )
     parser.add_argument(
@@ -198,6 +232,9 @@ def main() -> None:
     backend_name, backend_mod = get_io_backend()
     print(f"IO backend: {backend_name}")
 
+    # Rename prediction files in pred_dir: remove trailing image suffix (e.g., "_0000")
+    remove_suffix_from_pred_filenames(args.pred_dir, args.image_suffix)
+
     pred_paths = list_nii_files(args.pred_dir)
     if not pred_paths:
         raise FileNotFoundError(f"No NIfTI files found in pred_dir: {args.pred_dir}")
@@ -208,7 +245,12 @@ def main() -> None:
 
     for pred_path in pred_paths:
         pred_name = os.path.basename(pred_path)
-        case_id = strip_nii_ext(pred_name)
+        case_id_raw = strip_nii_ext(pred_name)
+        case_id = (
+            case_id_raw[: -len(args.image_suffix)]
+            if args.image_suffix and case_id_raw.endswith(args.image_suffix)
+            else case_id_raw
+        )
         gt_path = find_gt_path(args.gt_dir, case_id)
         image_path = find_image_path(args.image_dir, case_id, args.image_suffix)
 
