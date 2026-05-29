@@ -125,6 +125,20 @@ def safe_hd95_3d(pred: np.ndarray, gt: np.ndarray, spacing_xyz: Tuple[float, flo
     return float("nan")
 
 
+def safe_asd_3d(pred: np.ndarray, gt: np.ndarray, spacing_xyz: Tuple[float, float, float]) -> float:
+    pred_bin = (pred > 0).astype(np.uint8)
+    gt_bin = (gt > 0).astype(np.uint8)
+
+    pred_any = pred_bin.max() > 0
+    gt_any = gt_bin.max() > 0
+
+    # ASD is only defined/evaluated when both GT and Pred are non-empty.
+    if pred_any and gt_any:
+        return float(metric.binary.asd(pred_bin, gt_bin, voxelspacing=spacing_xyz_to_zyx(spacing_xyz)))
+
+    return float("nan")
+
+
 def compute_2d_metrics_nonempty_slices(
     pred_zyx: np.ndarray,
     gt_zyx: np.ndarray,
@@ -498,6 +512,7 @@ def evaluate_one_model(
         "3D Dice",
         "3D HD95 (mm)",
         f"Surface DSC ({int(SURFACE_TOL_MM)}mm)",
+        "ASD (mm)",
         "APL_add (mm)",
         "APL_del (mm)",
         "APL_total (mm)",
@@ -513,7 +528,7 @@ def evaluate_one_model(
 
         if not gt_path:
             print(f"[Skip] GT not found for id={key}, pred={os.path.basename(pred_path)}")
-            rows.append([case_id, "", "", "", "", "", "", "", ""])
+            rows.append([case_id, "", "", "", "", "", "", "", "", ""])
             continue
 
         gt_img = sitk.ReadImage(gt_path)
@@ -522,7 +537,7 @@ def evaluate_one_model(
         ok, msg = check_image_consistency(gt_img, pred_img)
         if not ok:
             print(f"[Skip] {case_id}: {msg}")
-            rows.append([case_id, "", "", "", "", "", "", "", ""])
+            rows.append([case_id, "", "", "", "", "", "", "", "", ""])
             continue
 
         gt = sitk.GetArrayFromImage(gt_img)   # [Z, Y, X]
@@ -533,6 +548,7 @@ def evaluate_one_model(
         dice3d = dice_coefficient(pred, gt)
         hd95_3d = safe_hd95_3d(pred, gt, spacing_xyz)
         surface_dsc = compute_surface_dsc_3d(pred, gt, spacing_xyz, tolerance_mm=SURFACE_TOL_MM)
+        asd_3d = safe_asd_3d(pred, gt, spacing_xyz)
         apl_add_mm, apl_del_mm, apl_total_mm = compute_apl_bidirectional_mm(
             pred, gt, spacing_xyz, tolerance_mm=APL_TOL_MM
         )
@@ -545,6 +561,7 @@ def evaluate_one_model(
                 round(dice3d, 2) if not np.isnan(dice3d) else "",
                 round(hd95_3d, 2) if not np.isnan(hd95_3d) else "",
                 round(surface_dsc, 2) if not np.isnan(surface_dsc) else "",
+                round(asd_3d, 2) if not np.isnan(asd_3d) else "",
                 round(apl_add_mm, 2),
                 round(apl_del_mm, 2),
                 round(apl_total_mm, 2),
@@ -561,18 +578,18 @@ def evaluate_one_model(
                 metric_vals.append(np.nan)
         numeric_matrix.append(metric_vals)
 
-    arr = np.asarray(numeric_matrix, dtype=float) if numeric_matrix else np.empty((0, 8))
+    arr = np.asarray(numeric_matrix, dtype=float) if numeric_matrix else np.empty((0, 9))
 
     mean_row: List[object] = ["Mean"]
     std_row: List[object] = ["STD"]
 
     if arr.size == 0:
-        mean_row.extend([""] * 8)
-        std_row.extend([""] * 8)
+        mean_row.extend([""] * 9)
+        std_row.extend([""] * 9)
     else:
         means = np.nanmean(arr, axis=0)
         stds = np.nanstd(arr, axis=0, ddof=1)
-        for i in range(8):
+        for i in range(9):
             mean_row.append(round(float(means[i]), 2) if not np.isnan(means[i]) else "")
             std_row.append(round(float(stds[i]), 2) if not np.isnan(stds[i]) else "")
 
@@ -585,9 +602,10 @@ def evaluate_one_model(
         f"3D Dice={mean_row[3]} {PM} {std_row[3]} | "
         f"3D HD95={mean_row[4]} {PM} {std_row[4]} | "
         f"Surface DSC={mean_row[5]} {PM} {std_row[5]} | "
-        f"APL_add={mean_row[6]} {PM} {std_row[6]} | "
-        f"APL_del={mean_row[7]} {PM} {std_row[7]} | "
-        f"APL_total={mean_row[8]} {PM} {std_row[8]}"
+        f"ASD={mean_row[6]} {PM} {std_row[6]} | "
+        f"APL_add={mean_row[7]} {PM} {std_row[7]} | "
+        f"APL_del={mean_row[8]} {PM} {std_row[8]} | "
+        f"APL_total={mean_row[9]} {PM} {std_row[9]}"
     )
 
 
@@ -598,6 +616,7 @@ def generate_summary_mean_sheet(wb: openpyxl.Workbook) -> None:
         "3D Dice",
         "3D HD95 (mm)",
         f"Surface DSC ({int(SURFACE_TOL_MM)}mm)",
+        "ASD (mm)",
         "APL_add (mm)",
         "APL_del (mm)",
         "APL_total (mm)",
@@ -655,14 +674,14 @@ def generate_summary_mean_sheet(wb: openpyxl.Workbook) -> None:
 # Run
 # =========================
 if __name__ == "__main__":
-    base_dir = r"C:\Users\dell\Desktop\Eso_83"
-    gt_dir = os.path.join(base_dir, "labelsTs")
-    output_excel = os.path.join(base_dir, "Eval_metrics.xlsx")
+    base_dir = r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\Deeplabv3+"
+    gt_dir = r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\labelsTs"
+    output_excel = os.path.join(base_dir, "Deeplabv3+_Eval_metrics.xlsx")
 
     model_paths = {
-        "nnUNet_baseline": os.path.join(base_dir, "nnUNet_all_volume"),
-        "nnUNet_post": os.path.join(base_dir, "nnUNet_all_postprocess"),
-        "nnUNet_pre": os.path.join(base_dir, "nnUNet_crop_restore"),
+        "Deeplabv3+_baseline": os.path.join(base_dir, "Deeplabv3+_all_rawpred"),
+        "Deeplabv3+_post": os.path.join(base_dir, "Deeplabv3+_all_postprocess"),
+        "Deeplabv3+_pre": os.path.join(base_dir, "Deeplabv3+_all_preprocess"),
     }
 
     gt_index = build_numeric_index(gt_dir)

@@ -1,10 +1,11 @@
 import argparse
 import glob
 import os
+from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 from monai.data import DataLoader, Dataset, decollate_batch
-from monai.inferers import sliding_window_inference
 from monai.transforms import (
     AsDiscreted,
     Compose,
@@ -14,29 +15,33 @@ from monai.transforms import (
     Lambdad,
     LoadImaged,
     Orientationd,
+    Resized,
     SaveImaged,
     ScaleIntensityRanged,
     Spacingd,
 )
 
+# Use the same model definition as train.py.
 from train import AttentionUNet3D
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AttentionUNet testing with fold ensemble.")
+    parser = argparse.ArgumentParser(description="AttentionUNet testing with full-volume inference and inverse transform.")
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--runs_root", type=str, default="./runs/AttentionUNet")
     parser.add_argument("--save_dir", type=str, default="./predictions")
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=1, help="Full-volume inference should usually keep batch_size=1.")
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--roi_x", type=int, default=96)
-    parser.add_argument("--roi_y", type=int, default=96)
-    parser.add_argument("--roi_z", type=int, default=64)
+
+    parser.add_argument("--roi_x", type=int, default=256)
+    parser.add_argument("--roi_y", type=int, default=256)
+    parser.add_argument("--roi_z", type=int, default=128)
     parser.add_argument("--sw_batch_size", type=int, default=2)
     parser.add_argument("--infer_overlap", type=float, default=0.5)
     parser.add_argument("--threshold", type=float, default=0.5)
+
     parser.add_argument("--num_folds", type=int, default=5)
-    parser.add_argument("--fold", type=int, default=None)
+    parser.add_argument("--fold", type=int, default=None, help="Use one fold only. If omitted, ensemble all folds.")
 
     parser.add_argument("--a_min", type=float, default=-160.0)
     parser.add_argument("--a_max", type=float, default=240.0)
@@ -50,11 +55,18 @@ def parse_args():
     parser.add_argument("--f3", type=int, default=128)
     parser.add_argument("--f4", type=int, default=256)
     parser.add_argument("--f5", type=int, default=512)
+
+    parser.add_argument("--image_dir", type=str, default="imagesTs", help="Subfolder under data_root for test images.")
+    parser.add_argument("--label_dir", type=str, default="labelsTs", help="Subfolder under data_root for test labels. Optional if absent.")
+    parser.add_argument("--save_prob", action="store_true", help="Also save the inverse-transformed probability map.")
+    parser.add_argument("--debug", action="store_true", help="Print image/logit/pred shapes for troubleshooting.")
     return parser.parse_args()
 
 
-def _binarize_label(x):
-    return (x > 0).astype(x.dtype)
+def binarize_label(x):
+    if isinstance(x, torch.Tensor):
+        return (x > 0).float()
+    return (x > 0).astype(np.float32)
 
 
 def strip_nii_ext(filename: str) -> str:
@@ -76,30 +88,45 @@ def label_case_id(path: str) -> str:
     return strip_nii_ext(os.path.basename(path))
 
 
-def build_test_data(data_root: str):
-    images = sorted(glob.glob(os.path.join(data_root, "imagesTs", "*_0000.nii.gz")) + glob.glob(os.path.join(data_root, "imagesTs", "*_0000.nii")))
-    labels = sorted(glob.glob(os.path.join(data_root, "labelsTs", "*.nii.gz")) + glob.glob(os.path.join(data_root, "labelsTs", "*.nii")))
+def _find_images(folder: str) -> List[str]:
+    paths = sorted(glob.glob(os.path.join(folder, "*_0000.nii.gz")) + glob.glob(os.path.join(folder, "*_0000.nii")))
+    if not paths:
+        paths = sorted(glob.glob(os.path.join(folder, "*.nii.gz")) + glob.glob(os.path.join(folder, "*.nii")))
+    return paths
 
+
+def build_test_data(data_root: str, image_dir: str, label_dir: str) -> List[Dict[str, str]]:
+    image_folder = os.path.join(data_root, image_dir)
+    label_folder = os.path.join(data_root, label_dir)
+
+    images = _find_images(image_folder)
     if not images:
-        raise FileNotFoundError(f"No test images found under: {os.path.join(data_root, 'imagesTs')}")
-    if not labels:
-        raise FileNotFoundError(f"No test labels found under: {os.path.join(data_root, 'labelsTs')}")
+        raise FileNotFoundError(f"No test images found under: {image_folder}")
 
     image_map = {image_case_id(p): p for p in images}
-    label_map = {label_case_id(p): p for p in labels}
+    data: List[Dict[str, str]] = []
 
-    image_ids = set(image_map.keys())
-    label_ids = set(label_map.keys())
-    if image_ids != label_ids:
-        missing_labels = sorted(image_ids - label_ids)
-        missing_images = sorted(label_ids - image_ids)
-        raise ValueError(
-            "Image/label case IDs are inconsistent. "
-            f"missing_labels={len(missing_labels)}, missing_images={len(missing_images)}"
-        )
+    labels = sorted(glob.glob(os.path.join(label_folder, "*.nii.gz")) + glob.glob(os.path.join(label_folder, "*.nii")))
+    if labels:
+        label_map = {label_case_id(p): p for p in labels}
+        image_ids = set(image_map.keys())
+        label_ids = set(label_map.keys())
+        if image_ids != label_ids:
+            missing_labels = sorted(image_ids - label_ids)
+            missing_images = sorted(label_ids - image_ids)
+            raise ValueError(
+                "Image/label case IDs are inconsistent. "
+                f"missing_labels={len(missing_labels)}, missing_images={len(missing_images)}\n"
+                f"First missing labels: {missing_labels[:5]}\n"
+                f"First missing images: {missing_images[:5]}"
+            )
+        for cid in sorted(image_ids):
+            data.append({"case_id": cid, "image": image_map[cid], "label": label_map[cid]})
+    else:
+        for cid in sorted(image_map.keys()):
+            data.append({"case_id": cid, "image": image_map[cid]})
 
-    case_ids = sorted(image_ids)
-    return [{"image": image_map[cid], "label": label_map[cid]} for cid in case_ids]
+    return data
 
 
 def load_model(runs_root: str, fold: int, device: torch.device, args):
@@ -114,18 +141,43 @@ def load_model(runs_root: str, fold: int, device: torch.device, args):
     ).to(device)
 
     state = torch.load(model_path, map_location=device)
-    if isinstance(state, dict) and "model" in state:
-        model.load_state_dict(state["model"])
-    else:
-        model.load_state_dict(state)
+    model.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
     model.eval()
     return model, model_path
+
+
+def get_test_transforms(args, has_label: bool):
+    keys = ["image", "label"] if has_label else ["image"]
+    modes = ("bilinear", "nearest") if has_label else "bilinear"
+
+    transforms = [
+        LoadImaged(keys=keys),
+        EnsureChannelFirstd(keys=keys),
+        Orientationd(keys=keys, axcodes=args.axcodes),
+        Spacingd(
+            keys=keys,
+            pixdim=(args.pixdim_x, args.pixdim_y, args.pixdim_z),
+            mode=modes,
+        ),
+        ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
+        Resized(keys=keys, spatial_size=(args.roi_x, args.roi_y, args.roi_z), mode=modes),
+    ]
+    if has_label:
+        transforms.append(Lambdad(keys=["label"], func=binarize_label))
+    transforms.append(EnsureTyped(keys=keys, track_meta=True))
+    return Compose(transforms)
 
 
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
+
+    if args.batch_size != 1:
+        print("[Warn] Full-volume cases often have different shapes after spacing. batch_size=1 is recommended.")
+
+    data_dicts = build_test_data(args.data_root, args.image_dir, args.label_dir)
+    has_label = "label" in data_dicts[0]
 
     folds = [args.fold] if args.fold is not None else list(range(args.num_folds))
     models = []
@@ -135,31 +187,29 @@ def main():
         models.append(model)
         model_paths.append(model_path)
 
-    test_transforms = Compose([
-        LoadImaged(keys=["image", "label"]),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        Orientationd(keys=["image", "label"], axcodes=args.axcodes),
-        Spacingd(
-            keys=["image", "label"],
-            pixdim=(args.pixdim_x, args.pixdim_y, args.pixdim_z),
-            mode=("bilinear", "nearest"),
-        ),
-        ScaleIntensityRanged(keys=["image"], a_min=args.a_min, a_max=args.a_max, b_min=0.0, b_max=1.0, clip=True),
-        Lambdad(keys="label", func=_binarize_label),
-        EnsureTyped(keys=["image", "label"], track_meta=True),
-    ])
-    post_transforms = Compose([
-        AsDiscreted(keys="pred", threshold=args.threshold),
+    test_transforms = get_test_transforms(args, has_label)
+
+    # pred_prob: probability map in original CT space, useful for debugging.
+    # pred: binary mask in original CT space, saved as uint8.
+    post_transforms = [
         Invertd(
-            keys="pred",
+            keys=["pred_prob"],
             transform=test_transforms,
-            orig_keys="image",
+            orig_keys=["image"],
+            nearest_interp=False,
+            to_tensor=True,
+        ),
+        AsDiscreted(keys=["pred"], threshold=args.threshold),
+        Invertd(
+            keys=["pred"],
+            transform=test_transforms,
+            orig_keys=["image"],
             nearest_interp=True,
-            to_tensor=False,
+            to_tensor=True,
         ),
         SaveImaged(
-            keys="pred",
-            meta_keys="pred_meta_dict",
+            keys=["pred"],
+            meta_keys=["pred_meta_dict"],
             output_dir=args.save_dir,
             output_postfix="",
             output_ext=".nii.gz",
@@ -168,9 +218,23 @@ def main():
             resample=False,
             print_log=False,
         ),
-    ])
+    ]
+    if args.save_prob:
+        post_transforms.append(
+            SaveImaged(
+                keys=["pred_prob"],
+                meta_keys=["pred_prob_meta_dict"],
+                output_dir=args.save_dir,
+                output_postfix="prob",
+                output_ext=".nii.gz",
+                separate_folder=False,
+                output_dtype="float32",
+                resample=False,
+                print_log=False,
+            )
+        )
+    post_transforms = Compose(post_transforms)
 
-    data_dicts = build_test_data(args.data_root)
     test_ds = Dataset(data_dicts, test_transforms)
     test_loader = DataLoader(
         test_ds,
@@ -180,30 +244,37 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    print("\n===== AttentionUNet Test (probability-map ensemble) =====")
+    print("\n===== AttentionUNet Test: sliding-window full-volume inference =====")
     print(f"Device: {device}")
+    print(f"Cases: {len(data_dicts)} | Labels available: {has_label}")
     print(f"Folds: {folds}")
+    print(f"ROI size: {(args.roi_x, args.roi_y, args.roi_z)} | overlap: {args.infer_overlap}")
     for p in model_paths:
         print(f"Model: {p}")
     print(f"Save dir: {args.save_dir}")
 
-    roi_size = (args.roi_x, args.roi_y, args.roi_z)
     with torch.no_grad():
         for batch in test_loader:
             image = batch["image"].to(device)
-            prob_sum = None
+            case_id = batch.get("case_id", ["unknown"])[0] if isinstance(batch.get("case_id", None), list) else batch.get("case_id", "unknown")
+
+            prob_sum: Optional[torch.Tensor] = None
             for model in models:
-                logits = sliding_window_inference(
-                    image,
-                    roi_size=roi_size,
-                    sw_batch_size=args.sw_batch_size,
-                    predictor=model,
-                    overlap=args.infer_overlap,
-                )
+                logits = model(image)
                 probs = torch.sigmoid(logits)
                 prob_sum = probs if prob_sum is None else (prob_sum + probs)
 
-            batch["pred"] = prob_sum / float(len(models))
+            prob_mean = prob_sum / float(len(models))
+            batch["pred_prob"] = prob_mean.detach().cpu()
+            batch["pred"] = prob_mean.detach().cpu()
+
+            if args.debug:
+                print(
+                    f"Case {case_id} | image={tuple(image.shape)} | "
+                    f"prob={tuple(prob_mean.shape)} | "
+                    f"prob_min={prob_mean.min().item():.4f}, prob_max={prob_mean.max().item():.4f}"
+                )
+
             for item in decollate_batch(batch):
                 out = post_transforms(item)
                 meta = out.get("pred_meta_dict") if isinstance(out, dict) else None
@@ -212,6 +283,8 @@ def main():
                     print(f"Saved: {saved_to}")
                 else:
                     print("Saved one prediction file.")
+
+    print("Done.")
 
 
 if __name__ == "__main__":

@@ -107,26 +107,29 @@ class UpTransition(nn.Module):
 
 
 class OutputTransition(nn.Module):
-    def __init__(self, inChans, elu, nll):
+    def __init__(self, inChans, elu, nll, logits=False):
         super().__init__()
         self.conv1 = nn.Conv3d(inChans, 2, kernel_size=5, padding=2)
         self.bn1 = ContBatchNorm3d(2)
         self.conv2 = nn.Conv3d(2, 2, kernel_size=1)
         self.relu1 = ELUCons(2, elu)
         self.nll = nll
+        self.logits = logits
 
     def forward(self, x):
         out = self.relu1(self.bn1(self.conv1(x)))
         out = self.conv2(out)
         out = out.permute(0, 2, 3, 4, 1).contiguous()
         out = out.view(out.numel() // 2, 2)
+        if self.logits:
+            return out
         return F.log_softmax(out, dim=1) if self.nll else F.softmax(out, dim=1)
 
 
 class VNet(nn.Module):
     """V-Net extracted from mattmacy/vnet.pytorch."""
 
-    def __init__(self, elu=True, nll=False):
+    def __init__(self, elu=True, nll=False, logits=False):
         super().__init__()
         self.in_tr = InputTransition(16, elu)
         self.down_tr32 = DownTransition(16, 1, elu)
@@ -137,7 +140,7 @@ class VNet(nn.Module):
         self.up_tr128 = UpTransition(256, 128, 2, elu, dropout=True)
         self.up_tr64 = UpTransition(128, 64, 1, elu)
         self.up_tr32 = UpTransition(64, 32, 1, elu)
-        self.out_tr = OutputTransition(32, elu, nll)
+        self.out_tr = OutputTransition(32, elu, nll, logits=logits)
 
     def forward(self, x):
         out16 = self.in_tr(x)
