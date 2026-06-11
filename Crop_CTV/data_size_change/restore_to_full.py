@@ -198,7 +198,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Restore GT-slice-cropped predictions to full volume size")
     parser.add_argument(
         "--pred_dir",
-        default=r"D:\SAM\Crop\Rectal_146\Deeplabv3+\Deeplabv3+_pre_crop",
+        default=r"D:\SAM\Crop\Rectal_146\VNet\VNet_pre_crop",
         help="Prediction folder (*.nii / *.nii.gz)",
     )
     parser.add_argument(
@@ -213,7 +213,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--out_dir",
-        default=r"D:\SAM\Crop\Rectal_146\Deeplabv3+\Deeplabv3+_all_preprocess",
+        default=r"D:\SAM\Crop\Rectal_146\VNet\VNet_all_preprocess",
         help="Output folder",
     )
     parser.add_argument(

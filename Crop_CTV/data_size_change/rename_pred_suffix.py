@@ -9,7 +9,7 @@ from typing import List
 # -----------------------------
 # Edit here: set your paths/values directly in code
 # -----------------------------
-PRED_DIR = r"C:\Users\WS\Desktop\Crop\Rectal_146\VNet\VNet_all_rawpred"
+PRED_DIR = r"D:\SAM\Crop\Rectal_146\VNet\VNet_pre_crop"
 SUFFIX = "_0000"
 
 

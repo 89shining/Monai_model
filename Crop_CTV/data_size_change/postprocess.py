@@ -122,17 +122,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--pred_dir",
-        default=r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\Deeplabv3+\Deeplabv3+_all_rawpred",
+        default=r"D:\SAM\Crop\Rectal_146\VNet\VNet_all_rawpred",
         help="Full-volume prediction folder (*.nii / *.nii.gz)",
     )
     parser.add_argument(
         "--gt_dir",
-        default=r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\labelsTs",
+        default=r"D:\SAM\Crop\Rectal_146\labelsTs",
         help="Full-size GT folder",
     )
     parser.add_argument(
         "--out_dir",
-        default=r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\Deeplabv3+\Deeplabv3+_all_postprocess",
+        default=r"D:\SAM\Crop\Rectal_146\VNet\VNet_all_postprocess",
         help="Output folder",
     )
     parser.add_argument(

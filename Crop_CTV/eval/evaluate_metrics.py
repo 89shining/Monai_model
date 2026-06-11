@@ -674,14 +674,14 @@ def generate_summary_mean_sheet(wb: openpyxl.Workbook) -> None:
 # Run
 # =========================
 if __name__ == "__main__":
-    base_dir = r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\Deeplabv3+"
-    gt_dir = r"C:\Users\dell\Downloads\Crop\Crop\Rectal_146\labelsTs"
-    output_excel = os.path.join(base_dir, "Deeplabv3+_Eval_metrics.xlsx")
+    base_dir = r"D:\SAM\Crop\Eso_83\AttentionUNet"
+    gt_dir = r"D:\SAM\Crop\Eso_83\labelsTs"
+    output_excel = os.path.join(base_dir, "AttentionUNet_Eval_metrics.xlsx")
 
     model_paths = {
-        "Deeplabv3+_baseline": os.path.join(base_dir, "Deeplabv3+_all_rawpred"),
-        "Deeplabv3+_post": os.path.join(base_dir, "Deeplabv3+_all_postprocess"),
-        "Deeplabv3+_pre": os.path.join(base_dir, "Deeplabv3+_all_preprocess"),
+        "AttentionUNet_baseline": os.path.join(base_dir, "AttentionUNet_all_rawpred"),
+        "AttentionUNet_post": os.path.join(base_dir, "AttentionUNet_all_postprocess"),
+        "AttentionUNet_pre": os.path.join(base_dir, "AttentionUNet_all_preprocess"),
     }
 
     gt_index = build_numeric_index(gt_dir)
